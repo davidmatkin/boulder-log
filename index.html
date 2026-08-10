@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#14161a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Boulder Log</title>
+<style>html,body{margin:0;padding:0;background:#14161a;}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const storageLS = {
+  async get(k) { const v = localStorage.getItem(k); if (v == null) throw new Error("empty"); return { value: v }; },
+  async set(k, v) { localStorage.setItem(k, v); return { key: k }; },
+};
+
+const { useState, useEffect, useRef } = React;
+
+// ---------- constants ----------
+const GRADES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const HOLD = {
+  0: "#6BBF8A", 1: "#57AE77", 2: "#D9C548", 3: "#E0A93E", 4: "#E07B39",
+  5: "#D95545", 6: "#C04566", 7: "#9C4F9E", 8: "#7263C9", 9: "#4A4E69", 10: "#2b2e38",
+};
+const HOLD_TEXT = { 0: "#0d2417", 1: "#0d2417", 2: "#2e2708", 3: "#33220a", 4: "#331507", 5: "#fff", 6: "#fff", 7: "#fff", 8: "#fff", 9: "#e8e8ee", 10: "#c9ccd6" };
+const ANGLES = ["slab", "vert", "overhang", "cave"];
+const STYLES = ["crimpy", "slopey", "dynamic"];
+const SEND_TYPES = ["flash", "onsight", "repeat"];
+const QUALITIES = ["soft?", "solid", "limit"];
+const climbType = (c) => c.type || (c.sent ? "sent" : "fell"); // back-compat with older records
+const typeLabel = (t) => (t === "fell" ? "attempt" : t);
+const KEY = "boulderlog-v1";
+const pts = (g) => Math.max(1, g); // V0 & V1 = 1
+
+const LEGACY = [
+  { id: "L1", date: "2026-06-20", label: "Bouldering", dist: { 1: 1, 2: 4, 3: 11 }, score: 43, probs: 16 },
+  { id: "L2", date: "2026-07-11", label: "Lehi", dist: { 1: 1, 2: 2, 3: 7, 4: 6 }, score: 50, probs: 16 },
+  { id: "L3", date: "2026-07-14", label: "Lehi", dist: { 2: 8, 3: 8 }, score: 40, probs: 16 },
+  { id: "L4", date: "2026-07-16", label: "Lehi", dist: { 2: 2, 3: 7, 4: 7 }, score: 53, probs: 16 },
+  { id: "L5", date: "2026-07-18", label: "Lehi", dist: { 3: 6, 4: 10 }, score: 58, probs: 15 },
+  { id: "L6", date: "2026-07-21", label: "Lehi", dist: { 3: 1, 4: 8 }, score: 35, probs: 9,
+    notes: "Tweaky left middle finger, 2nd knuckle. Decided to do some open hand hangs and call it a day." },
+  { id: "L7", date: "2026-07-30", label: "Lehi", dist: { 3: 2, 4: 13 }, score: 58, probs: 15 },
+  // Reconstructed from memory after storage failure — scores approximate, no grade distribution.
+  { id: "L8", date: "2026-07-23", label: "Lehi", dist: {}, score: 52, probs: null,
+    notes: "Approximate — session lost to storage failure. Recalled as low fifties." },
+  { id: "L9", date: "2026-07-25", label: "Lehi", dist: {}, score: 40, probs: null,
+    notes: "Approximate — session lost to storage failure. Recalled as relatively low." },
+  { id: "L10", date: "2026-07-28", label: "Lehi", dist: {}, score: 40, probs: null,
+    notes: "Approximate — session lost to storage failure. Recalled as relatively low." },
+  { id: "L11", date: "2026-08-10", label: "Lehi", dist: { 3: 2, 4: 10, 5: 1 }, score: 51, probs: 13,
+    notes: "All 13 sent. One V4 onsight, the rest repeats. Session lost to phone storage, reconstructed same day.",
+    exercises: "Superset 1:\n5 sets, 10 sec dead hang, pronated\n3 sets, 10 rep wrist extension, 20 lbs\n\nSuperset 2:\n3 sets, 10 sec 90-degree lock off, pronated\n3 sets, 20 reps single leg floor bridges (alternating legs)\n3 sets, 10 reps two arm curls, +0 lbs\n\nSuperset 3:\n5 sets of three pull ups\n3 sets of finger warmups, 5 reps of 5:5 repeaters" },
+].map((s) => ({ ...s, legacy: true }));
+
+// ---------- helpers ----------
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (d) =>
+  new Date(d + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+const mmss = (sec) => {
+  if (sec == null) return "—";
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+};
+
+function sessionStats(s) {
+  if (s.legacy) {
+    const dist = s.dist;
+    const n = s.probs ?? Object.values(dist).reduce((a, b) => a + b, 0);
+    return { climbs: n || 0, effort: s.score, sends: n || 0, sendScore: s.score, avgPerc: n ? (s.score / n) : 0, avgRest: null, dist };
+  }
+  const climbs = s.climbs || [];
+  const dist = {};
+  let effort = 0, sendScore = 0, sends = 0, percSum = 0;
+  climbs.forEach((c) => {
+    // Scoring rule: posted grade counts unless it's a fall, which counts at perceived grade.
+    const scoreGrade = c.sent ? c.gym : c.perceived;
+    const p = pts(scoreGrade);
+    effort += p;
+    percSum += scoreGrade;
+    dist[scoreGrade] = (dist[scoreGrade] || 0) + 1;
+    if (c.sent) { sends += 1; sendScore += p; }
+  });
+  let restSum = 0, restN = 0;
+  for (let i = 1; i < climbs.length; i++) {
+    const gap = (climbs[i].ts - climbs[i - 1].ts) / 1000;
+    if (gap > 5 && gap < 3600) { restSum += gap; restN += 1; }
+  }
+  return {
+    climbs: climbs.length, effort, sends, sendScore,
+    avgPerc: climbs.length ? percSum / climbs.length : 0,
+    avgRest: restN ? restSum / restN : null, dist,
+  };
+}
+
+const ledger = (dist) => {
+  const ks = Object.keys(dist).map(Number).sort((a, b) => a - b);
+  if (!ks.length) return "";
+  const total = ks.reduce((sum, k) => sum + pts(k) * dist[k], 0);
+  return ks.map((k) => `(${k}×${dist[k]})`).join(" + ") + ` = ${total}`;
+};
+
+function toCSV(rows) {
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return rows.map((r) => r.map(esc).join(",")).join("\n");
+}
+
+function download(name, text) {
+  const blob = new Blob([text], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ---------- app ----------
+function BoulderLog() {
+  const [data, setData] = useState(null); // {sessions:[]}
+  const [tab, setTab] = useState("session");
+  const [selGrade, setSelGrade] = useState(null);
+  const [mode, setMode] = useState(null); // null | "fell" | "quality"
+  const [editOpen, setEditOpen] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const [status, setStatus] = useState("");
+  const [lastSaved, setLastSaved] = useState(null);
+  const saveTimer = useRef(null);
+
+  // load
+  useEffect(() => {
+    (async () => {
+      let d;
+      try {
+        const r = await storageLS.get(KEY);
+        d = JSON.parse(r.value);
+      } catch {
+        d = { sessions: [] };
+      }
+      if (!d.deleted) d.deleted = [];
+      // auto-end any unfinished session from a previous day so days never merge
+      const today = todayStr();
+      d.sessions = d.sessions.map((s) => (!s.legacy && !s.ended && s.date !== today ? { ...s, ended: true } : s));
+      // merge in any notebook sessions not already present and not deliberately deleted
+      const have = new Set(d.sessions.map((s) => s.id));
+      const gone = new Set(d.deleted);
+      LEGACY.forEach((l) => { if (!have.has(l.id) && !gone.has(l.id)) d.sessions.push(l); });
+      setData(d);
+      // storage self-test: write a probe and read it back
+      try {
+        const probe = "p" + Date.now();
+        await storageLS.set(KEY + "-probe", probe);
+        const back = await storageLS.get(KEY + "-probe");
+        if (JSON.parse(JSON.stringify(back.value)) !== probe) throw new Error("mismatch");
+      } catch {
+        setStatus("⚠ Storage test failed — data may NOT survive closing the app. Export CSV before leaving the gym.");
+      }
+    })();
+  }, []);
+
+  // persist (debounced)
+  useEffect(() => {
+    if (!data) return;
+    clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await storageLS.set(KEY, JSON.stringify(data));
+        setStatus("");
+        setLastSaved(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+      } catch {
+        setStatus("⚠ Couldn't save — data is in memory only right now. Export CSV before closing.");
+      }
+    }, 600);
+  }, [data]);
+
+  // clock for rest display
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (!data) return <div style={ui.shell}><div style={{ padding: 40, color: "#8b8f98" }}>Loading…</div></div>;
+
+  const active = data.sessions.find((s) => !s.legacy && !s.ended);
+  const climbs = active?.climbs || [];
+  const last = climbs[climbs.length - 1];
+  const restSince = last ? (now - last.ts) / 1000 : null;
+  const stats = active ? sessionStats(active) : null;
+
+  const update = (fn) => setData((d) => ({ ...d, sessions: d.sessions.map(fn) }));
+
+  const startSession = () => {
+    const s = { id: "S" + Date.now(), date: todayStr(), label: "Lehi", goal: "", exercises: "", notes: "", climbs: [], ended: false };
+    setData((d) => ({ ...d, sessions: [...d.sessions, s] }));
+    setTab("session");
+  };
+
+  const logClimb = (gym, perceived, type) => {
+    const c = { ts: Date.now(), gym, perceived, type, sent: type !== "fell", quality: "", system: false, name: "", angle: "", style: "", note: "" };
+    update((s) => (s.id === active.id ? { ...s, climbs: [...s.climbs, c] } : s));
+    setSelGrade(null);
+    setMode(type === "fell" ? null : "quality");
+    setEditOpen(false);
+  };
+
+  const patchLast = (patch) =>
+    update((s) => {
+      if (s.id !== active.id) return s;
+      const cs = [...s.climbs];
+      cs[cs.length - 1] = { ...cs[cs.length - 1], ...patch };
+      return { ...s, climbs: cs };
+    });
+
+  const deleteLast = () => {
+    update((s) => (s.id === active.id ? { ...s, climbs: s.climbs.slice(0, -1) } : s));
+    setEditOpen(false);
+  };
+
+  const patchSession = (patch) => update((s) => (s.id === active.id ? { ...s, ...patch } : s));
+  const endSession = () => { patchSession({ ended: true }); setEditOpen(false); };
+  const cancelSession = () => {
+    setData((d) => ({ ...d, sessions: d.sessions.filter((s) => s.id !== active.id) }));
+    setEditOpen(false); setSelGrade(null); setMode(null); setConfirmCancel(false);
+  };
+
+  const exportClimbs = () => {
+    const rows = [["date", "gym_label", "time", "gym_grade", "perceived_grade", "points", "type", "quality", "sent", "system_wall", "problem_name", "angle", "hold_style", "climb_note", "rest_before_sec"]];
+    data.sessions.filter((s) => !s.legacy).forEach((s) => {
+      (s.climbs || []).forEach((c, i) => {
+        const rest = i > 0 ? Math.round((c.ts - s.climbs[i - 1].ts) / 1000) : "";
+        rows.push([s.date, s.label, new Date(c.ts).toLocaleTimeString(), c.gym, c.perceived, pts(c.sent ? c.gym : c.perceived), climbType(c), c.quality || "", c.sent ? 1 : 0, c.system ? 1 : 0, c.name, c.angle, c.style, c.note || "", rest]);
+      });
+    });
+    download("climbs.csv", toCSV(rows));
+  };
+
+  const exportSessions = () => {
+    const rows = [["date", "label", "legacy", "problems", "effort_score", "sends", "send_score", "avg_perceived", "avg_rest_sec", "ledger", "goal", "exercise_notes", "session_notes"]];
+    data.sessions.forEach((s) => {
+      const st = sessionStats(s);
+      rows.push([s.date, s.label || "", s.legacy ? 1 : 0, st.climbs, st.effort, s.legacy ? "" : st.sends, s.legacy ? "" : st.sendScore, st.avgPerc.toFixed(2), st.avgRest ? Math.round(st.avgRest) : "", ledger(st.dist), s.goal || "", s.exercises || "", s.notes || ""]);
+    });
+    download("sessions.csv", toCSV(rows));
+  };
+
+  const deleteSession = (id) =>
+    setData((d) => ({
+      ...d,
+      sessions: d.sessions.filter((s) => s.id !== id),
+      deleted: [...(d.deleted || []), id],
+    }));
+
+  return (
+    <div style={ui.shell}>
+      <header style={ui.header}>
+        <div>
+          <div style={ui.brand}>BOULDER LOG</div>
+          <div style={ui.sub}>{fmtDate(todayStr())}{lastSaved ? ` · saved ${lastSaved}` : ""}</div>
+        </div>
+        <nav style={{ display: "flex", gap: 6 }}>
+          {["session", "history", "export"].map((t) => (
+            <button key={t} onClick={() => setTab(t)} style={{ ...ui.tab, ...(tab === t ? ui.tabOn : {}) }}>
+              {t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      {status && <div style={ui.warn}>{status}</div>}
+
+      {tab === "session" && (
+        <main style={ui.main}>
+          {!active ? (
+            <div style={ui.center}>
+              <p style={{ color: "#8b8f98", marginBottom: 16 }}>No session running.</p>
+              <button style={ui.primary} onClick={startSession}>Start session</button>
+            </div>
+          ) : (
+            <>
+              {/* live stats */}
+              <div style={ui.statRow}>
+                <Stat label="Climbs" value={stats.climbs} />
+                <Stat label="Effort" value={stats.effort} accent />
+                <Stat label="Sends" value={`${stats.sends} · ${stats.sendScore}`} />
+                <Stat label="Avg V" value={stats.avgPerc.toFixed(1)} />
+              </div>
+              <div style={ui.restBlock}>
+                <div>
+                  <div style={ui.restBig}>{mmss(restSince)}</div>
+                  <div style={ui.restLabel}>REST SINCE LAST CLIMB</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={ui.restAvg}>{mmss(stats.avgRest)}</div>
+                  <div style={ui.restLabel}>AVG REST</div>
+                </div>
+              </div>
+              {Object.keys(stats.dist).length > 0 && <div style={ui.ledger}>{ledger(stats.dist)}</div>}
+
+              {/* grade holds */}
+              <div style={ui.sectionLabel}>{mode === "fell" ? "GRADE-LEVEL EFFORT OF THE ATTEMPT" : "GRADE"}</div>
+              <div style={ui.holdRow}>
+                {GRADES.map((g) => (
+                  <button
+                    key={g}
+                    onClick={() => (mode === "fell" ? logClimb(selGrade, g, "fell") : setSelGrade(g === selGrade ? null : g))}
+                    style={{
+                      ...ui.hold,
+                      background: mode === "fell" ? "#4a4e58" : HOLD[g],
+                      color: mode === "fell" ? "#e8e8ee" : HOLD_TEXT[g],
+                      outline: mode !== "fell" && selGrade === g ? "3px solid #f2efe8" : "3px solid transparent",
+                      transform: mode !== "fell" && selGrade === g ? "scale(1.12)" : "scale(1)",
+                    }}
+                  >
+                    V{g}
+                  </button>
+                ))}
+              </div>
+
+              {mode === "fell" ? (
+                <button style={ui.ghost} onClick={() => setMode(null)}>Cancel</button>
+              ) : mode === "quality" ? (
+                <>
+                  <div style={ui.sectionLabel}>HOW WAS THE SEND?</div>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    {QUALITIES.map((q) => (
+                      <button key={q} style={{ ...ui.big, ...ui.sent, fontSize: 15 }}
+                        onClick={() => { patchLast({ quality: q }); setMode(null); }}>
+                        {q[0].toUpperCase() + q.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+                  <button style={{ ...ui.linkBtn, display: "block", margin: "8px auto 0" }} onClick={() => setMode(null)}>skip</button>
+                </>
+              ) : (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  {SEND_TYPES.map((t) => (
+                    <button key={t} disabled={selGrade == null}
+                      style={{ ...ui.big, ...ui.sent, opacity: selGrade == null ? 0.35 : 1 }}
+                      onClick={() => logClimb(selGrade, selGrade, t)}>
+                      {t[0].toUpperCase() + t.slice(1)}
+                    </button>
+                  ))}
+                  <button disabled={selGrade == null}
+                    style={{ ...ui.big, ...ui.fell, opacity: selGrade == null ? 0.35 : 1 }}
+                    onClick={() => setMode("fell")}>
+                    Attempt
+                  </button>
+                </div>
+              )}
+
+              {/* last climb editor (closed by default) */}
+              {last && editOpen && mode == null && (
+                <div style={ui.card}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                    <b>
+                      Last: V{last.gym} {typeLabel(climbType(last))}
+                      {last.quality ? ` (${last.quality})` : ""}
+                      {!last.sent ? ` · effort V${last.perceived}` : ""}
+                    </b>
+                    <button style={ui.linkBtn} onClick={() => setEditOpen(false)}>close</button>
+                  </div>
+                  {last.sent && (
+                    <div style={ui.chipRow}>
+                      <span style={ui.chipLabel}>Send</span>
+                      {QUALITIES.map((q) => (
+                        <button key={q} onClick={() => patchLast({ quality: last.quality === q ? "" : q })}
+                          style={{ ...ui.chip, ...(last.quality === q ? ui.chipOn : {}) }}>{q}</button>
+                      ))}
+                    </div>
+                  )}
+                  <div style={ui.chipRow}>
+                    <button onClick={() => patchLast({ system: !last.system })} style={{ ...ui.chip, ...(last.system ? ui.chipOn : {}) }}>system wall</button>
+                    {last.system && (
+                      <input style={ui.input} placeholder="problem name" value={last.name}
+                        onChange={(e) => patchLast({ name: e.target.value })} />
+                    )}
+                  </div>
+                  <div style={ui.chipRow}>
+                    {ANGLES.map((a) => (
+                      <button key={a} onClick={() => patchLast({ angle: last.angle === a ? "" : a })}
+                        style={{ ...ui.chip, ...(last.angle === a ? ui.chipOn : {}) }}>{a}</button>
+                    ))}
+                  </div>
+                  <div style={ui.chipRow}>
+                    {STYLES.map((a) => (
+                      <button key={a} onClick={() => patchLast({ style: last.style === a ? "" : a })}
+                        style={{ ...ui.chip, ...(last.style === a ? ui.chipOn : {}) }}>{a}</button>
+                    ))}
+                    <button style={{ ...ui.chip, color: "#D95545", borderColor: "#D95545" }} onClick={deleteLast}>delete</button>
+                  </div>
+                  <textarea
+                    style={{ ...ui.textarea, marginTop: 10 }} rows={2}
+                    placeholder="Note on this climb…"
+                    value={last.note || ""} onChange={(e) => patchLast({ note: e.target.value })}
+                  />
+                </div>
+              )}
+              {last && !editOpen && mode == null && (
+                <button style={ui.linkBtn} onClick={() => setEditOpen(true)}>
+                  add notes to last climb (V{last.gym} {typeLabel(climbType(last))})
+                </button>
+              )}
+
+              {/* goal + exercises */}
+              <div style={ui.sectionLabel}>SESSION GOAL</div>
+              <input style={{ ...ui.input, width: "100%" }} placeholder="e.g. 5 V3s & 5 V4s"
+                value={active.goal} onChange={(e) => patchSession({ goal: e.target.value })} />
+
+              <div style={ui.sectionLabel}>WARM-UP & EXERCISES (narrative)</div>
+              <textarea
+                style={ui.textarea} rows={5}
+                placeholder={"Chin-ups 3×6 @ 60–80%…\nWrist ext 50lbs ×8, ×3 — elbow felt stable.\nFatigue 4/10."}
+                value={active.exercises} onChange={(e) => patchSession({ exercises: e.target.value })}
+              />
+
+              <div style={ui.sectionLabel}>SESSION NOTES</div>
+              <textarea
+                style={ui.textarea} rows={4}
+                placeholder={"Anything worth remembering: how the elbow felt, short on time, climbed with a friend, why there was a gap since last session…"}
+                value={active.notes || ""} onChange={(e) => patchSession({ notes: e.target.value })}
+              />
+
+              <button style={{ ...ui.ghost, marginTop: 10 }} onClick={endSession}>End session</button>
+              {!confirmCancel ? (
+                <button style={{ ...ui.linkBtn, display: "block", margin: "10px auto 0" }} onClick={() => setConfirmCancel(true)}>
+                  Cancel session (discard everything)
+                </button>
+              ) : (
+                <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                  <button style={{ ...ui.ghost, flex: 1, color: "#D95545", borderColor: "#D95545" }} onClick={cancelSession}>
+                    Yes, discard this session
+                  </button>
+                  <button style={{ ...ui.ghost, flex: 1 }} onClick={() => setConfirmCancel(false)}>Keep it</button>
+                </div>
+              )}
+            </>
+          )}
+        </main>
+      )}
+
+      {tab === "history" && <History sessions={data.sessions} onDelete={deleteSession} />}
+
+      {tab === "export" && (
+        <main style={ui.main}>
+          <p style={{ color: "#8b8f98", lineHeight: 1.5 }}>
+            Two files for R. <b style={{ color: "#f2efe8" }}>climbs.csv</b> has one row per climb (with rest gaps);{" "}
+            <b style={{ color: "#f2efe8" }}>sessions.csv</b> has one row per session, including the five notebook sessions.
+          </p>
+          <button style={{ ...ui.primary, marginTop: 12 }} onClick={exportClimbs}>Download climbs.csv</button>
+          <button style={{ ...ui.primary, marginTop: 10 }} onClick={exportSessions}>Download sessions.csv</button>
+        </main>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, accent }) {
+  return (
+    <div style={{ flex: 1, textAlign: "center" }}>
+      <div style={{ fontSize: 22, fontWeight: 800, color: accent ? "#E0A93E" : "#f2efe8", fontVariantNumeric: "tabular-nums" }}>{value}</div>
+      <div style={{ fontSize: 10, letterSpacing: 1.4, color: "#8b8f98" }}>{label.toUpperCase()}</div>
+    </div>
+  );
+}
+
+function History({ sessions, onDelete }) {
+  const [confirmId, setConfirmId] = useState(null);
+  const ordered = [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const chron = [...sessions].sort((a, b) => (a.date > b.date ? 1 : -1));
+  const scores = chron.map((s) => sessionStats(s).effort);
+  const max = Math.max(...scores, 1), min = Math.min(...scores, 0);
+  const W = 320, H = 90, PAD = 8;
+  const x = (i) => PAD + (i * (W - 2 * PAD)) / Math.max(1, scores.length - 1);
+  const y = (v) => H - PAD - ((v - min) * (H - 2 * PAD)) / Math.max(1, max - min);
+  const path = scores.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ");
+
+  return (
+    <main style={ui.main}>
+      <div style={ui.sectionLabel}>EFFORT SCORE TREND</div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", background: "#1d2026", borderRadius: 10 }}>
+        <path d={path} fill="none" stroke="#E0A93E" strokeWidth="2.5" strokeLinecap="round" />
+        {scores.map((v, i) => (
+          <circle key={i} cx={x(i)} cy={y(v)} r="3.5" fill={chron[i].legacy ? "#8b8f98" : "#E0A93E"} />
+        ))}
+      </svg>
+      <div style={{ fontSize: 11, color: "#8b8f98", margin: "6px 0 14px" }}>grey dots = notebook sessions</div>
+
+      {ordered.map((s) => {
+        const st = sessionStats(s);
+        return (
+          <div key={s.id} style={ui.card}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <b>{fmtDate(s.date)} · {s.label}{s.legacy ? " (notebook)" : ""}</b>
+              <b style={{ color: "#E0A93E" }}>{st.effort}</b>
+            </div>
+            <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 13, color: "#c9ccd6", marginTop: 4 }}>
+              {ledger(st.dist)}
+            </div>
+            <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 4 }}>
+              {st.climbs} problems{!s.legacy && <> · {st.sends} sends ({st.sendScore}) · avg rest {mmss(st.avgRest)}</>}
+            </div>
+            {s.goal && <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 2 }}>Goal: {s.goal}</div>}
+            {s.exercises && (
+              <div style={{ fontSize: 12, color: "#c9ccd6", marginTop: 6, whiteSpace: "pre-wrap", borderLeft: "2px solid #33363e", paddingLeft: 8 }}>
+                {s.exercises}
+              </div>
+            )}
+            {s.notes && (
+              <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 6, whiteSpace: "pre-wrap", fontStyle: "italic", borderLeft: "2px solid #33363e", paddingLeft: 8 }}>
+                {s.notes}
+              </div>
+            )}
+            {confirmId === s.id ? (
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button style={{ ...ui.chip, color: "#D95545", borderColor: "#D95545" }}
+                  onClick={() => { onDelete(s.id); setConfirmId(null); }}>
+                  Yes, delete this session
+                </button>
+                <button style={ui.chip} onClick={() => setConfirmId(null)}>Keep it</button>
+              </div>
+            ) : (
+              <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(s.id)}>delete</button>
+            )}
+          </div>
+        );
+      })}
+    </main>
+  );
+}
+
+// ---------- styles ----------
+const ui = {
+  shell: {
+    minHeight: "100vh", background: "#14161a", color: "#f2efe8",
+    fontFamily: "-apple-system, 'Segoe UI', Roboto, sans-serif", maxWidth: 460, margin: "0 auto",
+  },
+  header: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    padding: "16px 16px 10px", borderBottom: "1px solid #24262c",
+  },
+  brand: { fontWeight: 900, letterSpacing: 3, fontSize: 15 },
+  sub: { fontSize: 11, color: "#8b8f98", marginTop: 2 },
+  tab: {
+    background: "none", border: "1px solid #33363e", color: "#8b8f98",
+    padding: "6px 10px", borderRadius: 999, fontSize: 12, cursor: "pointer",
+  },
+  tabOn: { background: "#f2efe8", color: "#14161a", border: "1px solid #f2efe8", fontWeight: 700 },
+  warn: { background: "#3a2a12", color: "#E0A93E", fontSize: 12, padding: "8px 16px" },
+  main: { padding: 16 },
+  center: { textAlign: "center", paddingTop: 60 },
+  primary: {
+    display: "block", width: "100%", background: "#E0A93E", color: "#14161a",
+    border: "none", padding: "14px", borderRadius: 12, fontSize: 16, fontWeight: 800, cursor: "pointer",
+  },
+  ghost: {
+    display: "block", width: "100%", background: "none", color: "#8b8f98",
+    border: "1px solid #33363e", padding: "12px", borderRadius: 12, fontSize: 14, cursor: "pointer",
+  },
+  statRow: { display: "flex", background: "#1d2026", borderRadius: 12, padding: "12px 6px", gap: 4 },
+  restBlock: {
+    display: "flex", justifyContent: "space-between", alignItems: "flex-end",
+    background: "#1d2026", borderRadius: 12, padding: "14px 16px", marginTop: 10,
+  },
+  restBig: { fontSize: 56, fontWeight: 900, lineHeight: 1, color: "#f2efe8", fontVariantNumeric: "tabular-nums" },
+  restAvg: { fontSize: 24, fontWeight: 800, lineHeight: 1.2, color: "#8b8f98", fontVariantNumeric: "tabular-nums" },
+  restLabel: { fontSize: 9, letterSpacing: 1.6, color: "#8b8f98", marginTop: 6, fontWeight: 700 },
+  ledger: {
+    fontFamily: "ui-monospace, monospace", fontSize: 14, color: "#E0A93E",
+    padding: "8px 4px 0", letterSpacing: 0.5,
+  },
+  sectionLabel: { fontSize: 10, letterSpacing: 2, color: "#8b8f98", margin: "18px 0 8px", fontWeight: 700 },
+  holdRow: { display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 },
+  hold: {
+    width: 52, height: 52, borderRadius: "50%", border: "none", fontWeight: 800, fontSize: 14,
+    cursor: "pointer", transition: "transform 0.1s", boxShadow: "0 3px 0 rgba(0,0,0,0.35)",
+  },
+  big: { flex: 1, padding: "16px", borderRadius: 12, fontSize: 17, fontWeight: 800, cursor: "pointer", border: "none" },
+  sent: { background: "#f2efe8", color: "#14161a" },
+  fell: { background: "none", color: "#f2efe8", border: "2px solid #33363e" },
+  card: { background: "#1d2026", borderRadius: 12, padding: 12, marginTop: 14, fontSize: 14 },
+  chipRow: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10, alignItems: "center" },
+  chipLabel: { fontSize: 11, color: "#8b8f98", marginRight: 2 },
+  chip: {
+    background: "none", border: "1px solid #33363e", color: "#c9ccd6",
+    padding: "5px 10px", borderRadius: 999, fontSize: 12, cursor: "pointer",
+  },
+  chipOn: { background: "#f2efe8", color: "#14161a", borderColor: "#f2efe8", fontWeight: 700 },
+  linkBtn: { background: "none", border: "none", color: "#8b8f98", fontSize: 12, cursor: "pointer", textDecoration: "underline", padding: "8px 0" },
+  input: {
+    background: "#14161a", border: "1px solid #33363e", color: "#f2efe8",
+    borderRadius: 8, padding: "8px 10px", fontSize: 14,
+  },
+  textarea: {
+    width: "100%", boxSizing: "border-box", background: "#14161a", border: "1px solid #33363e",
+    color: "#f2efe8", borderRadius: 10, padding: 10, fontSize: 14, fontFamily: "inherit", lineHeight: 1.5,
+  },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<BoulderLog />);
+</script>
+</body>
+</html>
