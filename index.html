@@ -35,6 +35,15 @@ const SEND_TYPES = ["flash", "onsight", "repeat"];
 const QUALITIES = ["soft?", "solid", "limit"];
 const climbType = (c) => c.type || (c.sent ? "sent" : "fell"); // back-compat with older records
 const typeLabel = (t) => (t === "fell" ? "attempt" : t);
+const ENTRY_KINDS = ["exercise", "injury", "test", "note"];
+const ENTRY_PLACEHOLDER = {
+  exercise: "e.g. Density hangs: 3×25s open, 3×22s half crimp. Felt solid.",
+  injury: "How does it feel today? Better / same / worse than last time? Any swelling?",
+  test: "Optional note — conditions, which attempt, how it felt.",
+  note: "Anything worth remembering — travel, sleep, motivation, gym conditions.",
+};
+const DAY_AFTER = ["better", "same", "worse"];
+const DAY_AFTER_COLOR = { better: "#6BBF8A", same: "#c9ccd6", worse: "#E0A93E" };
 const KEY = "boulderlog-v1";
 const pts = (g) => Math.max(1, g); // V0 & V1 = 1
 
@@ -60,7 +69,11 @@ const LEGACY = [
 ].map((s) => ({ ...s, legacy: true }));
 
 // ---------- helpers ----------
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// Local dates, not UTC — evening sessions must not roll over to tomorrow's date.
+const localDateStr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const todayStr = () => localDateStr(new Date());
+const daysAgoStr = (n) => { const d = new Date(); d.setDate(d.getDate() - n); return localDateStr(d); };
+const weekdayName = (d) => new Date(d + "T12:00:00").toLocaleDateString(undefined, { weekday: "long" });
 const fmtDate = (d) =>
   new Date(d + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 const mmss = (sec) => {
@@ -130,6 +143,8 @@ function BoulderLog() {
   const [mode, setMode] = useState(null); // null | "fell" | "quality"
   const [editOpen, setEditOpen] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [entryDraft, setEntryDraft] = useState(null); // standalone-entry form state
+  const [checkinNote, setCheckinNote] = useState("");
   const [now, setNow] = useState(Date.now());
   const [status, setStatus] = useState("");
   const [lastSaved, setLastSaved] = useState(null);
@@ -146,6 +161,7 @@ function BoulderLog() {
         d = { sessions: [] };
       }
       if (!d.deleted) d.deleted = [];
+      if (!d.entries) d.entries = []; // standalone entries (exercise / injury / test / note)
       // auto-end any unfinished session from a previous day so days never merge
       const today = todayStr();
       d.sessions = d.sessions.map((s) => (!s.legacy && !s.ended && s.date !== today ? { ...s, ended: true } : s));
@@ -243,12 +259,20 @@ function BoulderLog() {
   };
 
   const exportSessions = () => {
-    const rows = [["date", "label", "legacy", "problems", "effort_score", "sends", "send_score", "avg_perceived", "avg_rest_sec", "ledger", "goal", "exercise_notes", "session_notes"]];
+    const rows = [["date", "label", "legacy", "problems", "effort_score", "sends", "send_score", "avg_perceived", "avg_rest_sec", "ledger", "goal", "exercise_notes", "session_notes", "day_after_status", "day_after_note"]];
     data.sessions.forEach((s) => {
       const st = sessionStats(s);
-      rows.push([s.date, s.label || "", s.legacy ? 1 : 0, st.climbs, st.effort, s.legacy ? "" : st.sends, s.legacy ? "" : st.sendScore, st.avgPerc.toFixed(2), st.avgRest ? Math.round(st.avgRest) : "", ledger(st.dist), s.goal || "", s.exercises || "", s.notes || ""]);
+      rows.push([s.date, s.label || "", s.legacy ? 1 : 0, st.climbs, st.effort, s.legacy ? "" : st.sends, s.legacy ? "" : st.sendScore, st.avgPerc.toFixed(2), st.avgRest ? Math.round(st.avgRest) : "", ledger(st.dist), s.goal || "", s.exercises || "", s.notes || "", s.day_after?.status || "", s.day_after?.note || ""]);
     });
     download("sessions.csv", toCSV(rows));
+  };
+
+  const exportEntries = () => {
+    const rows = [["date", "kind", "issue", "test_name", "test_value", "test_unit", "note"]];
+    [...(data.entries || [])].sort((a, b) => (a.date > b.date ? 1 : -1)).forEach((e) => {
+      rows.push([e.date, e.kind || "", e.issue || "", e.test_name || "", e.test_value ?? "", e.test_unit || "", e.note || ""]);
+    });
+    download("entries.csv", toCSV(rows));
   };
 
   const deleteSession = (id) =>
@@ -257,6 +281,48 @@ function BoulderLog() {
       sessions: d.sessions.filter((s) => s.id !== id),
       deleted: [...(d.deleted || []), id],
     }));
+
+  // ----- standalone entries (feature 1) -----
+  const blankEntry = () => ({ date: todayStr(), kind: "", test_name: "", test_value: "", test_unit: "", note: "" });
+  const entryValid =
+    entryDraft && entryDraft.kind &&
+    (entryDraft.kind !== "test" ||
+      (entryDraft.test_name.trim() && entryDraft.test_value.trim() !== "" && !isNaN(Number(entryDraft.test_value))));
+  const saveEntry = () => {
+    if (!entryValid) return;
+    const e = { id: "E" + Date.now(), date: entryDraft.date || todayStr(), kind: entryDraft.kind, note: entryDraft.note.trim() };
+    if (entryDraft.kind === "test") {
+      e.test_name = entryDraft.test_name.trim();
+      e.test_value = Number(entryDraft.test_value);
+      e.test_unit = entryDraft.test_unit.trim();
+    }
+    setData((d) => ({ ...d, entries: [...(d.entries || []), e] }));
+    setEntryDraft(null);
+  };
+  const deleteEntry = (id) =>
+    setData((d) => ({
+      ...d,
+      entries: (d.entries || []).filter((e) => e.id !== id),
+      deleted: [...(d.deleted || []), id],
+    }));
+
+  // ----- morning-after check-in (feature 2) -----
+  const lastEnded = [...data.sessions]
+    .filter((s) => !s.legacy && s.ended)
+    .sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+  const checkin =
+    lastEnded && !lastEnded.day_after && !lastEnded.day_after_dismissed &&
+    (lastEnded.date === daysAgoStr(1) || lastEnded.date === daysAgoStr(2))
+      ? lastEnded : null;
+  const answerCheckin = (statusWord) => {
+    update((s) =>
+      s.id === checkin.id
+        ? { ...s, day_after: { status: statusWord, note: checkinNote.trim(), recorded_at: new Date().toISOString() } }
+        : s
+    );
+    setCheckinNote("");
+  };
+  const dismissCheckin = () => update((s) => (s.id === checkin.id ? { ...s, day_after_dismissed: true } : s));
 
   return (
     <div style={ui.shell}>
@@ -276,12 +342,74 @@ function BoulderLog() {
 
       {status && <div style={ui.warn}>{status}</div>}
 
+      {checkin && (
+        <div style={{ ...ui.card, margin: "12px 16px 0", border: "1px solid #E0A93E" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <b>How do you feel after {weekdayName(checkin.date)}'s session?</b>
+            <button style={ui.linkBtn} onClick={dismissCheckin}>dismiss</button>
+          </div>
+          <input
+            style={{ ...ui.input, width: "100%", boxSizing: "border-box", marginTop: 10 }}
+            placeholder="fingers? elbow? anything else? (optional)"
+            value={checkinNote} onChange={(e) => setCheckinNote(e.target.value)}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            {DAY_AFTER.map((w) => (
+              <button key={w} style={{ ...ui.big, ...ui.sent, fontSize: 15, padding: "12px" }} onClick={() => answerCheckin(w)}>
+                {w[0].toUpperCase() + w.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {tab === "session" && (
         <main style={ui.main}>
           {!active ? (
             <div style={ui.center}>
               <p style={{ color: "#8b8f98", marginBottom: 16 }}>No session running.</p>
               <button style={ui.primary} onClick={startSession}>Start session</button>
+              {!entryDraft && (
+                <button style={{ ...ui.linkBtn, display: "block", margin: "14px auto 0" }} onClick={() => setEntryDraft(blankEntry())}>
+                  log training or a note (no session)
+                </button>
+              )}
+              {entryDraft && (
+                <div style={{ ...ui.card, textAlign: "left" }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                    <input type="date" style={ui.input} value={entryDraft.date}
+                      onChange={(e) => setEntryDraft({ ...entryDraft, date: e.target.value })} />
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {ENTRY_KINDS.map((k) => (
+                        <button key={k} onClick={() => setEntryDraft({ ...entryDraft, kind: entryDraft.kind === k ? "" : k })}
+                          style={{ ...ui.chip, ...(entryDraft.kind === k ? ui.chipOn : {}) }}>{k}</button>
+                      ))}
+                    </div>
+                  </div>
+                  {entryDraft.kind === "test" && (
+                    <div style={ui.chipRow}>
+                      <input style={{ ...ui.input, flex: "1 1 100%" }} placeholder="test name, e.g. Tindeq half-crimp L"
+                        value={entryDraft.test_name} onChange={(e) => setEntryDraft({ ...entryDraft, test_name: e.target.value })} />
+                      <input style={{ ...ui.input, width: 90 }} placeholder="value" inputMode="decimal"
+                        value={entryDraft.test_value} onChange={(e) => setEntryDraft({ ...entryDraft, test_value: e.target.value })} />
+                      <input style={{ ...ui.input, width: 90 }} placeholder="unit (lb, 0-10)"
+                        value={entryDraft.test_unit} onChange={(e) => setEntryDraft({ ...entryDraft, test_unit: e.target.value })} />
+                    </div>
+                  )}
+                  <textarea style={{ ...ui.textarea, marginTop: 10 }} rows={3}
+                    placeholder={ENTRY_PLACEHOLDER[entryDraft.kind] || "Pick a kind above, then write what happened."}
+                    value={entryDraft.note} onChange={(e) => setEntryDraft({ ...entryDraft, note: e.target.value })} />
+                  {entryDraft.kind === "test" && entryDraft.test_value.trim() !== "" && isNaN(Number(entryDraft.test_value)) && (
+                    <div style={{ fontSize: 12, color: "#E0A93E", marginTop: 6 }}>Test value needs to be a number.</div>
+                  )}
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <button style={{ ...ui.primary, flex: 1, opacity: entryValid ? 1 : 0.35 }} disabled={!entryValid} onClick={saveEntry}>
+                      Save entry
+                    </button>
+                    <button style={{ ...ui.ghost, flex: 1 }} onClick={() => setEntryDraft(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <>
@@ -446,16 +574,20 @@ function BoulderLog() {
         </main>
       )}
 
-      {tab === "history" && <History sessions={data.sessions} onDelete={deleteSession} />}
+      {tab === "history" && (
+        <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} />
+      )}
 
       {tab === "export" && (
         <main style={ui.main}>
           <p style={{ color: "#8b8f98", lineHeight: 1.5 }}>
-            Two files for R. <b style={{ color: "#f2efe8" }}>climbs.csv</b> has one row per climb (with rest gaps);{" "}
-            <b style={{ color: "#f2efe8" }}>sessions.csv</b> has one row per session, including the five notebook sessions.
+            Three files for R. <b style={{ color: "#f2efe8" }}>climbs.csv</b> has one row per climb (with rest gaps);{" "}
+            <b style={{ color: "#f2efe8" }}>sessions.csv</b> has one row per session, including the notebook sessions;{" "}
+            <b style={{ color: "#f2efe8" }}>entries.csv</b> has standalone training / injury / test / note entries.
           </p>
           <button style={{ ...ui.primary, marginTop: 12 }} onClick={exportClimbs}>Download climbs.csv</button>
           <button style={{ ...ui.primary, marginTop: 10 }} onClick={exportSessions}>Download sessions.csv</button>
+          <button style={{ ...ui.primary, marginTop: 10 }} onClick={exportEntries}>Download entries.csv</button>
         </main>
       )}
     </div>
@@ -471,9 +603,13 @@ function Stat({ label, value, accent }) {
   );
 }
 
-function History({ sessions, onDelete }) {
+function History({ sessions, entries, onDelete, onDeleteEntry }) {
   const [confirmId, setConfirmId] = useState(null);
-  const ordered = [...sessions].sort((a, b) => (a.date < b.date ? 1 : -1));
+  // sessions and standalone entries interleaved by date, sessions first on ties
+  const items = [
+    ...sessions.map((s) => ({ kind: "session", date: s.date, obj: s })),
+    ...entries.map((e) => ({ kind: "entry", date: e.date, obj: e })),
+  ].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.kind === "session" ? -1 : 1));
   const chron = [...sessions].sort((a, b) => (a.date > b.date ? 1 : -1));
   const scores = chron.map((s) => sessionStats(s).effort);
   const max = Math.max(...scores, 1), min = Math.min(...scores, 0);
@@ -493,7 +629,40 @@ function History({ sessions, onDelete }) {
       </svg>
       <div style={{ fontSize: 11, color: "#8b8f98", margin: "6px 0 14px" }}>grey dots = notebook sessions</div>
 
-      {ordered.map((s) => {
+      {items.map((it) => {
+        if (it.kind === "entry") {
+          const e = it.obj;
+          return (
+            <div key={e.id} style={{ ...ui.card, background: "none", border: "1px solid #24262c" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <b style={{ color: "#c9ccd6", fontWeight: 600 }}>
+                  {fmtDate(e.date)} · {e.kind || "entry"}{e.issue ? ` — ${e.issue}` : ""}
+                </b>
+                {e.kind === "test" && e.test_value != null && (
+                  <b style={{ color: "#E0A93E" }}>{e.test_value}{e.test_unit ? ` ${e.test_unit}` : ""}</b>
+                )}
+              </div>
+              {e.kind === "test" && e.test_name && (
+                <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 2 }}>{e.test_name}</div>
+              )}
+              {e.note && (
+                <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 6, whiteSpace: "pre-wrap" }}>{e.note}</div>
+              )}
+              {confirmId === e.id ? (
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button style={{ ...ui.chip, color: "#D95545", borderColor: "#D95545" }}
+                    onClick={() => { onDeleteEntry(e.id); setConfirmId(null); }}>
+                    Yes, delete this entry
+                  </button>
+                  <button style={ui.chip} onClick={() => setConfirmId(null)}>Keep it</button>
+                </div>
+              ) : (
+                <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(e.id)}>delete</button>
+              )}
+            </div>
+          );
+        }
+        const s = it.obj;
         const st = sessionStats(s);
         return (
           <div key={s.id} style={ui.card}>
@@ -507,6 +676,13 @@ function History({ sessions, onDelete }) {
             <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 4 }}>
               {st.climbs} problems{!s.legacy && <> · {st.sends} sends ({st.sendScore}) · avg rest {mmss(st.avgRest)}</>}
             </div>
+            {s.day_after && (
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                <span style={{ color: DAY_AFTER_COLOR[s.day_after.status] || "#c9ccd6" }}>●</span>
+                <span style={{ color: "#c9ccd6" }}> day after: {s.day_after.status}</span>
+                {s.day_after.note && <span style={{ color: "#8b8f98", fontStyle: "italic" }}> — {s.day_after.note}</span>}
+              </div>
+            )}
             {s.goal && <div style={{ fontSize: 12, color: "#8b8f98", marginTop: 2 }}>Goal: {s.goal}</div>}
             {s.exercises && (
               <div style={{ fontSize: 12, color: "#c9ccd6", marginTop: 6, whiteSpace: "pre-wrap", borderLeft: "2px solid #33363e", paddingLeft: 8 }}>
