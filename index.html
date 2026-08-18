@@ -119,20 +119,124 @@ const ledger = (dist) => {
   return ks.map((k) => `(${k}×${dist[k]})`).join(" + ") + ` = ${total}`;
 };
 
-function toCSV(rows) {
-  const esc = (v) => {
-    const s = String(v ?? "");
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  return rows.map((r) => r.map(esc).join(",")).join("\n");
-}
-
-function download(name, text) {
-  const blob = new Blob([text], { type: "text/csv" });
+function download(name, text, type = "text/markdown") {
+  const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = name; a.click();
   URL.revokeObjectURL(url);
+}
+
+// ---------- sharing suite (6a/6b/6c) ----------
+const SCHEMA_VERSION = 1;
+
+function sessionShareText(s) {
+  const st = sessionStats(s);
+  const L = [];
+  L.push(`# Boulder Log — ${s.date} ${s.label || ""}${s.intent ? ` [${s.intent}]` : ""}`.trimEnd());
+  L.push(`Problems: ${st.climbs} | Effort: ${st.effort}${s.legacy ? "" : ` | Sends: ${st.sends} (${st.sendScore})`}`);
+  const led = ledger(st.dist);
+  if (led) L.push(`Ledger: ${led}`);
+  if (s.goal) L.push(`Goal: ${s.goal}`);
+  const cs = s.climbs || [];
+  if (cs.length) {
+    L.push("Climbs:");
+    cs.forEach((c, i) => {
+      const rest = i > 0 ? Math.round((c.ts - cs[i - 1].ts) / 1000) : null;
+      const tags = [c.system ? `system${c.name ? ` "${c.name}"` : ""}` : "", c.angle, c.style].filter(Boolean).join(" ");
+      const bits = [`V${c.gym}`, typeLabel(climbType(c)), c.quality, tags, !c.sent ? `effort V${c.perceived}` : "", c.note].filter(Boolean).join(" ");
+      L.push(`- ${bits}${rest != null ? ` (rest ${rest}s)` : ""}`);
+    });
+  }
+  if (s.exercises) L.push(`Exercises: ${s.exercises}`);
+  if (s.notes) L.push(`Notes: ${s.notes}`);
+  if (s.day_after) L.push(`Day-after: ${s.day_after.status}${s.day_after.note ? ` — ${s.day_after.note}` : ""}`);
+  return L.join("\n");
+}
+
+function entryShareText(e) {
+  const L = [];
+  L.push(`# Boulder Log entry — ${e.date} [${e.kind || "entry"}${e.issue ? ` / ${e.issue}` : ""}]`);
+  if (e.kind === "test" && e.test_name) L.push(`${e.test_name}: ${e.test_value}${e.test_unit ? ` ${e.test_unit}` : ""}`);
+  if (e.note) L.push(e.note);
+  return L.join("\n");
+}
+
+function digestText(data, maxChars = 4000) {
+  const cutoff = daysAgoStr(42);
+  let sess = [...data.sessions].filter((s) => s.date >= cutoff).sort((a, b) => (a.date < b.date ? 1 : -1));
+  let ents = (data.entries || []).filter((e) => e.date >= cutoff).sort((a, b) => (a.date < b.date ? 1 : -1));
+  const build = () => {
+    const L = [`# Boulder Log digest — ${todayStr()}`];
+    if (sess.length) {
+      L.push("## Sessions");
+      sess.forEach((s) => {
+        const st = sessionStats(s);
+        const led = ledger(st.dist);
+        L.push(`- ${s.date}${s.intent ? ` [${s.intent}]` : ""} ${st.climbs}p, effort ${st.effort}${led ? `, ${led}` : ""}`);
+        const extra = [];
+        if (s.day_after) extra.push(`day-after: ${s.day_after.status}${s.day_after.note ? ` ${s.day_after.note}` : ""}`);
+        if (s.notes) extra.push(`notes: ${s.notes.replace(/\n/g, " ")}`);
+        if (extra.length) L.push(`  ${extra.join(" | ")}`);
+      });
+    }
+    const plain = ents.filter((e) => e.kind !== "test");
+    if (plain.length) {
+      L.push("## Training entries");
+      plain.forEach((e) => L.push(`- ${e.date} [${e.kind}${e.issue ? `/${e.issue}` : ""}] ${(e.note || "").replace(/\n/g, " ")}`));
+    }
+    const tests = ents.filter((e) => e.kind === "test" && e.test_name);
+    if (tests.length) {
+      L.push("## Tests");
+      const byName = {};
+      tests.forEach((e) => { (byName[e.test_name] = byName[e.test_name] || []).push(e); });
+      Object.keys(byName).forEach((name) => {
+        const es = [...byName[name]].sort((a, b) => (a.date > b.date ? 1 : -1));
+        const unit = es[es.length - 1].test_unit;
+        L.push(`- ${name}: ${es.map((e) => e.test_value).join(" → ")}${unit ? ` ${unit}` : ""} (${es[0].date} → ${es[es.length - 1].date})`);
+      });
+    }
+    const issues = {};
+    ents.filter((e) => e.kind === "injury" && e.issue).forEach((e) => {
+      if (!issues[e.issue] || issues[e.issue].date < e.date) issues[e.issue] = e;
+    });
+    if (Object.keys(issues).length) {
+      L.push("## Open issues");
+      Object.keys(issues).forEach((k) => L.push(`- ${k}: last entry ${issues[k].date}, ${(issues[k].note || "").replace(/\n/g, " ")}`));
+    }
+    return L.join("\n");
+  };
+  let out = build();
+  while (out.length > maxChars && (sess.length || ents.length)) {
+    // drop the oldest item first (lists are newest-first, so oldest is last)
+    if (sess.length >= ents.length) sess = sess.slice(0, -1); else ents = ents.slice(0, -1);
+    out = build();
+  }
+  return out;
+}
+
+function backupText(data) {
+  const sess = data.sessions || [], ents = data.entries || [];
+  const dates = sess.map((s) => s.date).sort();
+  const when = new Date().toLocaleString();
+  const summary = `${sess.length} sessions from ${dates[0] || "—"} to ${dates[dates.length - 1] || "—"}, ` +
+    `${ents.length} standalone entries, ${(data.deleted || []).length} deleted ids (tombstones).`;
+  const dump = JSON.stringify({ schema_version: SCHEMA_VERSION, ...data }, null, 2);
+  return `# Boulder Log backup — ${when}\n\n${summary}\n\n## Recent digest\n\n${digestText(data)}\n\n## Complete data (lossless)\n\n\`\`\`json\n${dump}\n\`\`\`\n`;
+}
+
+function parseBackup(text) {
+  const start = text.indexOf("```json");
+  const close = text.lastIndexOf("```");
+  if (start === -1 || close <= start) throw new Error("No JSON block found — paste the whole backup file.");
+  const open = text.indexOf("\n", start) + 1;
+  let obj;
+  try { obj = JSON.parse(text.slice(open, close)); }
+  catch { throw new Error("The JSON block wouldn't parse — is the paste complete?"); }
+  if (typeof obj.schema_version !== "number") throw new Error("Missing schema_version — not a Boulder Log backup.");
+  if (obj.schema_version > SCHEMA_VERSION) throw new Error(`Backup schema v${obj.schema_version} is newer than this app (v${SCHEMA_VERSION}).`);
+  if (!Array.isArray(obj.sessions)) throw new Error("Backup has no sessions array.");
+  return obj;
 }
 
 // ---------- app ----------
@@ -145,6 +249,11 @@ function BoulderLog() {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [entryDraft, setEntryDraft] = useState(null); // standalone-entry form state
   const [checkinNote, setCheckinNote] = useState("");
+  const [shareMsg, setShareMsg] = useState("");
+  const [shareFallback, setShareFallback] = useState(null); // text shown for manual copy when share+clipboard both fail
+  const [importText, setImportText] = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const shareMsgTimer = useRef(null);
   const [now, setNow] = useState(Date.now());
   const [status, setStatus] = useState("");
   const [lastSaved, setLastSaved] = useState(null);
@@ -241,38 +350,67 @@ function BoulderLog() {
   };
 
   const patchSession = (patch) => update((s) => (s.id === active.id ? { ...s, ...patch } : s));
-  const endSession = () => { patchSession({ ended: true }); setEditOpen(false); };
+  const endSession = () => { patchSession({ ended: true }); setEditOpen(false); setTab("history"); }; // History = the summary screen, with Share on top
   const cancelSession = () => {
     setData((d) => ({ ...d, sessions: d.sessions.filter((s) => s.id !== active.id) }));
     setEditOpen(false); setSelGrade(null); setMode(null); setConfirmCancel(false);
   };
 
-  const exportClimbs = () => {
-    const rows = [["date", "gym_label", "time", "gym_grade", "perceived_grade", "points", "type", "quality", "sent", "system_wall", "problem_name", "angle", "hold_style", "climb_note", "rest_before_sec"]];
-    data.sessions.filter((s) => !s.legacy).forEach((s) => {
-      (s.climbs || []).forEach((c, i) => {
-        const rest = i > 0 ? Math.round((c.ts - s.climbs[i - 1].ts) / 1000) : "";
-        rows.push([s.date, s.label, new Date(c.ts).toLocaleTimeString(), c.gym, c.perceived, pts(c.sent ? c.gym : c.perceived), climbType(c), c.quality || "", c.sent ? 1 : 0, c.system ? 1 : 0, c.name, c.angle, c.style, c.note || "", rest]);
+  // ----- sharing (6a) -----
+  const receipt = (msg) => {
+    setShareMsg(msg);
+    clearTimeout(shareMsgTimer.current);
+    shareMsgTimer.current = setTimeout(() => setShareMsg(""), 2500);
+  };
+  const doShare = async (text) => {
+    if (navigator.share) {
+      try { await navigator.share({ text }); return; }
+      catch (err) { if (err && err.name === "AbortError") return; } // user closed the sheet
+    }
+    try { await navigator.clipboard.writeText(text); receipt("copied to clipboard"); }
+    catch { setShareFallback(text); }
+  };
+
+  // ----- backup export + restore (6c) -----
+  const shareBackup = async () => {
+    const text = backupText(data);
+    try {
+      const file = new File([text], "boulder-log-backup.md", { type: "text/markdown" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: "boulder-log-backup.md" }); return; }
+        catch (err) { if (err && err.name === "AbortError") return; }
+      }
+    } catch {} // File constructor or canShare unavailable — fall through to download
+    download("boulder-log-backup.md", text);
+    receipt("downloaded boulder-log-backup.md");
+  };
+
+  const previewImport = () => {
+    try {
+      const b = parseBackup(importText);
+      const haveS = new Set(data.sessions.map((s) => s.id));
+      const haveE = new Set((data.entries || []).map((e) => e.id));
+      const gone = new Set([...(data.deleted || []), ...(b.deleted || [])]);
+      setImportPreview({
+        backup: b,
+        newS: (b.sessions || []).filter((s) => !haveS.has(s.id) && !gone.has(s.id)),
+        newE: (b.entries || []).filter((e) => !haveE.has(e.id) && !gone.has(e.id)),
       });
-    });
-    download("climbs.csv", toCSV(rows));
+    } catch (err) {
+      setImportPreview({ error: err.message });
+    }
   };
-
-  const exportSessions = () => {
-    const rows = [["date", "label", "legacy", "problems", "effort_score", "sends", "send_score", "avg_perceived", "avg_rest_sec", "ledger", "goal", "exercise_notes", "session_notes", "day_after_status", "day_after_note"]];
-    data.sessions.forEach((s) => {
-      const st = sessionStats(s);
-      rows.push([s.date, s.label || "", s.legacy ? 1 : 0, st.climbs, st.effort, s.legacy ? "" : st.sends, s.legacy ? "" : st.sendScore, st.avgPerc.toFixed(2), st.avgRest ? Math.round(st.avgRest) : "", ledger(st.dist), s.goal || "", s.exercises || "", s.notes || "", s.day_after?.status || "", s.day_after?.note || ""]);
-    });
-    download("sessions.csv", toCSV(rows));
-  };
-
-  const exportEntries = () => {
-    const rows = [["date", "kind", "issue", "test_name", "test_value", "test_unit", "note"]];
-    [...(data.entries || [])].sort((a, b) => (a.date > b.date ? 1 : -1)).forEach((e) => {
-      rows.push([e.date, e.kind || "", e.issue || "", e.test_name || "", e.test_value ?? "", e.test_unit || "", e.note || ""]);
-    });
-    download("entries.csv", toCSV(rows));
+  const applyImport = () => {
+    const { backup, newS, newE } = importPreview;
+    setData((d) => ({
+      ...d,
+      sessions: [...d.sessions, ...newS],
+      entries: [...(d.entries || []), ...newE],
+      deleted: Array.from(new Set([...(d.deleted || []), ...(backup.deleted || [])])),
+    }));
+    setImportPreview(null);
+    setImportText("");
+    receipt("backup merged");
   };
 
   const deleteSession = (id) =>
@@ -341,6 +479,17 @@ function BoulderLog() {
       </header>
 
       {status && <div style={ui.warn}>{status}</div>}
+      {shareMsg && <div style={{ ...ui.warn, background: "#16241a", color: "#6BBF8A" }}>{shareMsg}</div>}
+      {shareFallback != null && (
+        <div style={{ ...ui.card, margin: "12px 16px 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <b>Couldn't open the share sheet — copy manually:</b>
+            <button style={ui.linkBtn} onClick={() => setShareFallback(null)}>close</button>
+          </div>
+          <textarea readOnly rows={6} style={{ ...ui.textarea, marginTop: 8 }} value={shareFallback}
+            onFocus={(e) => e.target.select()} />
+        </div>
+      )}
 
       {checkin && (
         <div style={{ ...ui.card, margin: "12px 16px 0", border: "1px solid #E0A93E" }}>
@@ -575,19 +724,49 @@ function BoulderLog() {
       )}
 
       {tab === "history" && (
-        <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} />
+        <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} onShare={doShare} />
       )}
 
       {tab === "export" && (
         <main style={ui.main}>
           <p style={{ color: "#8b8f98", lineHeight: 1.5 }}>
-            Three files for R. <b style={{ color: "#f2efe8" }}>climbs.csv</b> has one row per climb (with rest gaps);{" "}
-            <b style={{ color: "#f2efe8" }}>sessions.csv</b> has one row per session, including the notebook sessions;{" "}
-            <b style={{ color: "#f2efe8" }}>entries.csv</b> has standalone training / injury / test / note entries.
+            One file, <b style={{ color: "#f2efe8" }}>boulder-log-backup.md</b>: a readable digest on top,
+            the complete data (lossless JSON, tombstones included) below. Share it to Box or a Claude chat —
+            it can restore everything on any device. Individual sessions share from their History cards.
           </p>
-          <button style={{ ...ui.primary, marginTop: 12 }} onClick={exportClimbs}>Download climbs.csv</button>
-          <button style={{ ...ui.primary, marginTop: 10 }} onClick={exportSessions}>Download sessions.csv</button>
-          <button style={{ ...ui.primary, marginTop: 10 }} onClick={exportEntries}>Download entries.csv</button>
+          <button style={{ ...ui.primary, marginTop: 12 }} onClick={shareBackup}>Share backup</button>
+
+          <div style={ui.sectionLabel}>IMPORT / RESTORE</div>
+          <p style={{ color: "#8b8f98", fontSize: 12, lineHeight: 1.5, margin: "0 0 8px" }}>
+            Pick or paste a backup file. Nothing is overwritten — records are merged in by id, with a preview first.
+          </p>
+          <input type="file" accept=".md,.txt,text/markdown,text/plain"
+            style={{ color: "#8b8f98", fontSize: 12, marginBottom: 8, maxWidth: "100%" }}
+            onChange={(ev) => {
+              const f = ev.target.files && ev.target.files[0];
+              if (f) f.text().then((t) => { setImportText(t); setImportPreview(null); });
+            }} />
+          <textarea style={ui.textarea} rows={4} placeholder="…or paste the whole backup file here"
+            value={importText} onChange={(ev) => { setImportText(ev.target.value); setImportPreview(null); }} />
+          <button style={{ ...ui.ghost, marginTop: 8, opacity: importText.trim() ? 1 : 0.35 }}
+            disabled={!importText.trim()} onClick={previewImport}>
+            Preview import
+          </button>
+          {importPreview && (importPreview.error ? (
+            <div style={{ ...ui.card, color: "#E0A93E" }}>{importPreview.error}</div>
+          ) : (
+            <div style={ui.card}>
+              <b>Backup holds {importPreview.backup.sessions.length} sessions, {(importPreview.backup.entries || []).length} entries,{" "}
+                {(importPreview.backup.deleted || []).length} tombstones.</b>
+              <div style={{ fontSize: 13, color: "#c9ccd6", marginTop: 6 }}>
+                New to this device: {importPreview.newS.length} sessions, {importPreview.newE.length} entries.
+              </div>
+              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                <button style={{ ...ui.primary, flex: 1 }} onClick={applyImport}>Apply merge</button>
+                <button style={{ ...ui.ghost, flex: 1 }} onClick={() => setImportPreview(null)}>Cancel</button>
+              </div>
+            </div>
+          ))}
         </main>
       )}
     </div>
@@ -603,7 +782,7 @@ function Stat({ label, value, accent }) {
   );
 }
 
-function History({ sessions, entries, onDelete, onDeleteEntry }) {
+function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
   const [confirmId, setConfirmId] = useState(null);
   // sessions and standalone entries interleaved by date, sessions first on ties
   const items = [
@@ -657,7 +836,10 @@ function History({ sessions, entries, onDelete, onDeleteEntry }) {
                   <button style={ui.chip} onClick={() => setConfirmId(null)}>Keep it</button>
                 </div>
               ) : (
-                <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(e.id)}>delete</button>
+                <div style={{ display: "flex", gap: 14 }}>
+                  <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => onShare(entryShareText(e))}>share</button>
+                  <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(e.id)}>delete</button>
+                </div>
               )}
             </div>
           );
@@ -703,7 +885,10 @@ function History({ sessions, entries, onDelete, onDeleteEntry }) {
                 <button style={ui.chip} onClick={() => setConfirmId(null)}>Keep it</button>
               </div>
             ) : (
-              <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(s.id)}>delete</button>
+              <div style={{ display: "flex", gap: 14 }}>
+                <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => onShare(sessionShareText(s))}>share</button>
+                <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(s.id)}>delete</button>
+              </div>
             )}
           </div>
         );
