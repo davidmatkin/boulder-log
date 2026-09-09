@@ -23,7 +23,6 @@ const storageLS = {
 const { useState, useEffect, useRef } = React;
 
 // ---------- constants ----------
-const GRADES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const HOLD = {
   0: "#6BBF8A", 1: "#57AE77", 2: "#D9C548", 3: "#E0A93E", 4: "#E07B39",
   5: "#D95545", 6: "#C04566", 7: "#9C4F9E", 8: "#7263C9", 9: "#4A4E69", 10: "#2b2e38",
@@ -31,10 +30,15 @@ const HOLD = {
 const HOLD_TEXT = { 0: "#0d2417", 1: "#0d2417", 2: "#2e2708", 3: "#33220a", 4: "#331507", 5: "#fff", 6: "#fff", 7: "#fff", 8: "#fff", 9: "#e8e8ee", 10: "#c9ccd6" };
 const ANGLES = ["slab", "vert", "overhang", "cave"];
 const STYLES = ["crimpy", "slopey", "dynamic"];
-const SEND_TYPES = ["flash", "onsight", "repeat"];
-const QUALITIES = ["soft?", "solid", "limit"];
+const SEND_TYPES = ["flash", "redpoint", "repeat"];
+const QUALITIES = ["soft", "on grade", "sandbagged"]; // grade assessment: how it felt FOR the grade
 const climbType = (c) => c.type || (c.sent ? "sent" : "fell"); // back-compat with older records
-const typeLabel = (t) => (t === "fell" ? "attempt" : t);
+const typeLabel = (t) => (t === "fell" ? "attempt" : t === "onsight" ? "redpoint" : t); // stored "onsight" always meant redpoint
+const qualityLabel = (q) => ({ "soft?": "soft", "solid": "on grade", "limit": "sandbagged" }[q] || q); // legacy values display-mapped
+const MB_PTS = { MB3: 5, MB4: 6 }; // MoonBoard grades score at fixed effort values
+const DISCS = [0, 1, 2, 3, 4, 5, 6, 7, "MB3", "MB4"]; // V8–V10 retired Sep 2026; old records still render
+const gradeLabel = (c) => c.mb || `V${c.gym}`;
+const keyPts = (k) => (MB_PTS[k] !== undefined ? MB_PTS[k] : Math.max(1, Number(k)));
 const ENTRY_KINDS = ["exercise", "injury", "test", "note"];
 const ENTRY_PLACEHOLDER = {
   exercise: "e.g. Density hangs: 3×25s open, 3×22s half crimp. Felt solid.",
@@ -78,6 +82,7 @@ const fmtDate = (d) =>
   new Date(d + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 const mmss = (sec) => {
   if (sec == null) return "—";
+  sec = Math.max(0, sec); // clock state can lag a just-logged climb by up to 1s
   const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
 };
@@ -97,7 +102,8 @@ function sessionStats(s) {
     const p = pts(scoreGrade);
     effort += p;
     percSum += scoreGrade;
-    dist[scoreGrade] = (dist[scoreGrade] || 0) + 1;
+    const key = c.sent && c.mb ? c.mb : scoreGrade; // sent board climbs ledger as their own (MB3×n) term
+    dist[key] = (dist[key] || 0) + 1;
     if (c.sent) { sends += 1; sendScore += p; }
   });
   let restSum = 0, restN = 0;
@@ -113,10 +119,13 @@ function sessionStats(s) {
 }
 
 const ledger = (dist) => {
-  const ks = Object.keys(dist).map(Number).sort((a, b) => a - b);
+  const ks = Object.keys(dist).sort((a, b) => {
+    const d = keyPts(a) - keyPts(b);
+    return d !== 0 ? d : MB_PTS[a] !== undefined ? 1 : -1; // V term before MB term at equal point value
+  });
   if (!ks.length) return "";
-  const total = ks.reduce((sum, k) => sum + pts(k) * dist[k], 0);
-  return ks.map((k) => `(${k}×${dist[k]})`).join(" + ") + ` = ${total}`;
+  const total = ks.reduce((sum, k) => sum + keyPts(k) * dist[k], 0);
+  return ks.map((k) => `(${MB_PTS[k] !== undefined ? k : Number(k)}×${dist[k]})`).join(" + ") + ` = ${total}`;
 };
 
 function download(name, text, type = "text/markdown") {
@@ -144,7 +153,7 @@ function sessionShareText(s) {
     cs.forEach((c, i) => {
       const rest = i > 0 ? Math.round((c.ts - cs[i - 1].ts) / 1000) : null;
       const tags = [c.system ? `system${c.name ? ` "${c.name}"` : ""}` : "", c.angle, c.style].filter(Boolean).join(" ");
-      const bits = [`V${c.gym}`, typeLabel(climbType(c)), c.quality, tags, !c.sent ? `effort V${c.perceived}` : "", c.note].filter(Boolean).join(" ");
+      const bits = [gradeLabel(c), typeLabel(climbType(c)), qualityLabel(c.quality), tags, !c.sent ? `effort V${c.perceived}` : "", c.note].filter(Boolean).join(" ");
       L.push(`- ${bits}${rest != null ? ` (rest ${rest}s)` : ""}`);
     });
   }
@@ -239,6 +248,46 @@ function parseBackup(text) {
   return obj;
 }
 
+// ---------- interval timer (separate storage key; never touches boulderlog-v1) ----------
+const TIMER_KEY = "boulderlog-timer-v1";
+const TIMER_PRESETS = {
+  recruit: { name: "Recruitment Pulls", desc: "5s effort · 5s · ×4 · 3min · 3 sets", work: 5, restRep: 5, reps: 4, restSet: 180, sets: 3, prep: 10 },
+  density: { name: "Density Hangs", desc: "30s hang · 15s · ×3 · 4min · 3 grips", work: 30, restRep: 15, reps: 3, restSet: 240, sets: 3, prep: 10 },
+  repeat: { name: "5:5 Repeaters", desc: "5s on · 5s off · ×6 · 1min · 3 sets", work: 5, restRep: 5, reps: 6, restSet: 60, sets: 3, prep: 10 },
+  hammer: { name: "Hammer Iso (elbow)", desc: "25s hold · 35s · ×4 · 1 set", work: 25, restRep: 35, reps: 4, restSet: 0, sets: 1, prep: 8 },
+  tabata: { name: "Classic Tabata", desc: "20s on · 10s off · ×8 · 1 set", work: 20, restRep: 10, reps: 8, restSet: 0, sets: 1, prep: 10 },
+};
+const TIMER_FIELDS = [
+  { k: "work", label: "Work", note: "effort / hang (s)", min: 1, max: 120, step: 1 },
+  { k: "restRep", label: "Rest between reps", note: "seconds", min: 0, max: 600, step: 5 },
+  { k: "reps", label: "Reps per set", note: "count", min: 1, max: 30, step: 1 },
+  { k: "restSet", label: "Rest between sets", note: "seconds", min: 0, max: 600, step: 15 },
+  { k: "sets", label: "Sets", note: "count", min: 1, max: 20, step: 1 },
+  { k: "prep", label: "Get-ready countdown", note: "seconds", min: 0, max: 60, step: 1 },
+];
+// CVD-safe: two hues only. Green = go, blue = any rest; set breaks differ by label and fill, never by hue.
+const TCOLOR = { prep: "#6a7280", work: "#5bb98c", restRep: "#4a8fb8", restSet: "#4a8fb8", await: "#4a8fb8", done: "#f2efe8" };
+const TLABEL = { prep: "Get Ready", work: "GO", restRep: "Rest", restSet: "Set Break", await: "Set Done", done: "Done" };
+
+let _actx = null;
+const audioCtx = () => { if (!_actx) { try { _actx = new (window.AudioContext || window.webkitAudioContext)(); } catch {} } return _actx; };
+function beep(freq, dur = 0.15, vol = 0.35) {
+  const c = audioCtx(); if (!c) return;
+  try {
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0, c.currentTime);
+    g.gain.linearRampToValueAtTime(vol, c.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur + 0.02);
+  } catch {}
+}
+function speak(text) {
+  if (!("speechSynthesis" in window)) return;
+  try { const u = new SpeechSynthesisUtterance(text); u.rate = 1; speechSynthesis.cancel(); speechSynthesis.speak(u); } catch {}
+}
+
 // ---------- app ----------
 function BoulderLog() {
   const [data, setData] = useState(null); // {sessions:[]}
@@ -247,6 +296,7 @@ function BoulderLog() {
   const [mode, setMode] = useState(null); // null | "fell" | "quality"
   const [editOpen, setEditOpen] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [tableOpen, setTableOpen] = useState(false);
   const [entryDraft, setEntryDraft] = useState(null); // standalone-entry form state
   const [checkinNote, setCheckinNote] = useState("");
   const [shareMsg, setShareMsg] = useState("");
@@ -329,7 +379,11 @@ function BoulderLog() {
   };
 
   const logClimb = (gym, perceived, type) => {
-    const c = { ts: Date.now(), gym, perceived, type, sent: type !== "fell", quality: "", system: false, name: "", angle: "", style: "", note: "" };
+    const mb = typeof gym === "string" ? gym : null; // "MB3"/"MB4" discs carry a fixed effort value
+    const postedNum = mb ? MB_PTS[mb] : gym;
+    const percNum = typeof perceived === "string" ? MB_PTS[perceived] : perceived;
+    const c = { ts: Date.now(), gym: postedNum, perceived: percNum, type, sent: type !== "fell", quality: "", system: !!mb, name: "", angle: "", style: "", note: "" };
+    if (mb) c.mb = mb;
     update((s) => (s.id === active.id ? { ...s, climbs: [...s.climbs, c] } : s));
     setSelGrade(null);
     setMode(type === "fell" ? null : "quality");
@@ -465,13 +519,13 @@ function BoulderLog() {
   return (
     <div style={ui.shell}>
       <header style={ui.header}>
-        <div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
           <div style={ui.brand}>BOULDER LOG</div>
           <div style={ui.sub}>{fmtDate(todayStr())}{lastSaved ? ` · saved ${lastSaved}` : ""}</div>
         </div>
-        <nav style={{ display: "flex", gap: 6 }}>
-          {["session", "history", "export"].map((t) => (
-            <button key={t} onClick={() => setTab(t)} style={{ ...ui.tab, ...(tab === t ? ui.tabOn : {}) }}>
+        <nav style={{ display: "flex", gap: 6, marginTop: 10 }}>
+          {["session", "timer", "history", "export"].map((t) => (
+            <button key={t} onClick={() => setTab(t)} style={{ ...ui.tab, flex: 1, ...(tab === t ? ui.tabOn : {}) }}>
               {t[0].toUpperCase() + t.slice(1)}
             </button>
           ))}
@@ -535,6 +589,11 @@ function BoulderLog() {
                       ))}
                     </div>
                   </div>
+                  {entryDraft.kind === "exercise" && (
+                    <button style={{ ...ui.linkBtn, display: "block", padding: "8px 0 0" }} onClick={() => setTab("timer")}>
+                      open interval timer
+                    </button>
+                  )}
                   {entryDraft.kind === "test" && (
                     <div style={ui.chipRow}>
                       <input style={{ ...ui.input, flex: "1 1 100%" }} placeholder="test name, e.g. Tindeq half-crimp L"
@@ -580,32 +639,77 @@ function BoulderLog() {
                 </div>
               </div>
               {Object.keys(stats.dist).length > 0 && <div style={ui.ledger}>{ledger(stats.dist)}</div>}
+              {climbs.length > 0 && (
+                <button style={ui.linkBtn} onClick={() => setTableOpen(!tableOpen)}>
+                  {tableOpen ? "hide climb table" : "show climb table"}
+                </button>
+              )}
+              {tableOpen && climbs.length > 0 && (() => {
+                let cum = 0;
+                return (
+                  <div style={{ ...ui.card, marginTop: 6, padding: "8px 12px", overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "ui-monospace, monospace", fontSize: 12, color: "#c9ccd6" }}>
+                      <thead>
+                        <tr style={{ color: "#8b8f98" }}>
+                          <th style={{ textAlign: "left", padding: "2px 8px 6px 0" }}>#</th>
+                          <th style={{ textAlign: "left", paddingRight: 8 }}>grade</th>
+                          <th style={{ textAlign: "left", paddingRight: 8 }}>type</th>
+                          <th style={{ textAlign: "right", paddingRight: 8 }}>pts</th>
+                          <th style={{ textAlign: "right", paddingRight: 8 }}>total</th>
+                          <th style={{ textAlign: "right" }}>avg</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {climbs.map((c, i) => {
+                          const p = pts(c.sent ? c.gym : c.perceived);
+                          cum += p;
+                          return (
+                            <tr key={c.ts}>
+                              <td style={{ padding: "2px 8px 2px 0" }}>{i + 1}</td>
+                              <td style={{ paddingRight: 8 }}>{c.sent ? gradeLabel(c) : `${gradeLabel(c)}→e${c.perceived}`}</td>
+                              <td style={{ paddingRight: 8 }}>{typeLabel(climbType(c))}</td>
+                              <td style={{ textAlign: "right", paddingRight: 8 }}>{p}</td>
+                              <td style={{ textAlign: "right", paddingRight: 8 }}>{cum}</td>
+                              <td style={{ textAlign: "right" }}>{(cum / (i + 1)).toFixed(1)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
 
               {/* grade holds */}
               <div style={ui.sectionLabel}>{mode === "fell" ? "GRADE-LEVEL EFFORT OF THE ATTEMPT" : "GRADE"}</div>
               <div style={ui.holdRow}>
-                {GRADES.map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => (mode === "fell" ? logClimb(selGrade, g, "fell") : setSelGrade(g === selGrade ? null : g))}
-                    style={{
-                      ...ui.hold,
-                      background: mode === "fell" ? "#4a4e58" : HOLD[g],
-                      color: mode === "fell" ? "#e8e8ee" : HOLD_TEXT[g],
-                      outline: mode !== "fell" && selGrade === g ? "3px solid #f2efe8" : "3px solid transparent",
-                      transform: mode !== "fell" && selGrade === g ? "scale(1.12)" : "scale(1)",
-                    }}
-                  >
-                    V{g}
-                  </button>
-                ))}
+                {(mode === "fell" ? DISCS.filter((g) => typeof g === "number") : DISCS).map((g) => {
+                  const isMB = typeof g === "string";
+                  return (
+                    <button
+                      key={g}
+                      onClick={() => (mode === "fell" ? logClimb(selGrade, g, "fell") : setSelGrade(g === selGrade ? null : g))}
+                      style={{
+                        ...ui.hold,
+                        background: mode === "fell" ? "#4a4e58" : isMB ? "#2b2e38" : HOLD[g],
+                        color: mode === "fell" ? "#e8e8ee" : isMB ? "#E0A93E" : HOLD_TEXT[g],
+                        border: isMB && mode !== "fell" ? "2px solid #E0A93E" : "none",
+                        fontSize: isMB ? 13 : 14,
+                        outline: mode !== "fell" && selGrade === g ? "3px solid #f2efe8" : "3px solid transparent",
+                        transform: mode !== "fell" && selGrade === g ? "scale(1.12)" : "scale(1)",
+                      }}
+                    >
+                      {isMB ? g : `V${g}`}
+                    </button>
+                  );
+                })}
               </div>
 
               {mode === "fell" ? (
                 <button style={ui.ghost} onClick={() => setMode(null)}>Cancel</button>
               ) : mode === "quality" ? (
                 <>
-                  <div style={ui.sectionLabel}>HOW WAS THE SEND?</div>
+                  <div style={ui.sectionLabel}>GRADE CHECK — HOW DID IT FEEL FOR THE GRADE?</div>
                   <div style={{ display: "flex", gap: 10 }}>
                     {QUALITIES.map((q) => (
                       <button key={q} style={{ ...ui.big, ...ui.sent, fontSize: 15 }}
@@ -638,18 +742,18 @@ function BoulderLog() {
                 <div style={ui.card}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                     <b>
-                      Last: V{last.gym} {typeLabel(climbType(last))}
-                      {last.quality ? ` (${last.quality})` : ""}
+                      Last: {gradeLabel(last)} {typeLabel(climbType(last))}
+                      {last.quality ? ` (${qualityLabel(last.quality)})` : ""}
                       {!last.sent ? ` · effort V${last.perceived}` : ""}
                     </b>
                     <button style={ui.linkBtn} onClick={() => setEditOpen(false)}>close</button>
                   </div>
                   {last.sent && (
                     <div style={ui.chipRow}>
-                      <span style={ui.chipLabel}>Send</span>
+                      <span style={ui.chipLabel}>Grade</span>
                       {QUALITIES.map((q) => (
-                        <button key={q} onClick={() => patchLast({ quality: last.quality === q ? "" : q })}
-                          style={{ ...ui.chip, ...(last.quality === q ? ui.chipOn : {}) }}>{q}</button>
+                        <button key={q} onClick={() => patchLast({ quality: qualityLabel(last.quality) === q ? "" : q })}
+                          style={{ ...ui.chip, ...(qualityLabel(last.quality) === q ? ui.chipOn : {}) }}>{q}</button>
                       ))}
                     </div>
                   )}
@@ -682,7 +786,7 @@ function BoulderLog() {
               )}
               {last && !editOpen && mode == null && (
                 <button style={ui.linkBtn} onClick={() => setEditOpen(true)}>
-                  add notes to last climb (V{last.gym} {typeLabel(climbType(last))})
+                  add notes to last climb ({gradeLabel(last)} {typeLabel(climbType(last))})
                 </button>
               )}
 
@@ -722,6 +826,11 @@ function BoulderLog() {
           )}
         </main>
       )}
+
+      {/* Timer stays mounted so a stray tab tap never kills a running protocol */}
+      <div style={{ display: tab === "timer" ? "block" : "none" }}>
+        <main style={ui.main}><TimerView /></main>
+      </div>
 
       {tab === "history" && (
         <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} onShare={doShare} />
@@ -897,16 +1006,276 @@ function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
   );
 }
 
+function TimerView() {
+  const saved = useRef((() => { try { return JSON.parse(localStorage.getItem(TIMER_KEY) || "null") || {}; } catch { return {}; } })()).current;
+  const [cfg, setCfg] = useState({ ...TIMER_PRESETS.recruit, ...(saved.cfg || {}) });
+  const [sound, setSound] = useState(saved.sound !== false);
+  const [voice, setVoice] = useState(saved.voice !== false);
+  const [manual, setManual] = useState(!!saved.manual);
+  const [cfgOpen, setCfgOpen] = useState(false);
+  const [disp, setDisp] = useState(() => ({ status: "idle", type: null, remain: cfg.prep > 0 ? cfg.prep : cfg.work, dur: 0, rep: 0, set: 0, elapsed: 0 }));
+  const eng = useRef({ status: "idle", sched: [], idx: 0, endAt: 0, startedAt: 0, remainPaused: 0, lastTick: null, id: null });
+  const wakeRef = useRef(null);
+  const soundRef = useRef(sound); soundRef.current = sound;
+  const voiceRef = useRef(voice); voiceRef.current = voice;
+
+  useEffect(() => { try { localStorage.setItem(TIMER_KEY, JSON.stringify({ cfg, sound, voice, manual })); } catch {} }, [cfg, sound, voice, manual]);
+
+  const cue = {
+    work: () => { if (soundRef.current) beep(880, 0.18, 0.4); if (voiceRef.current) speak("Go"); },
+    restRep: () => { if (soundRef.current) beep(440, 0.16, 0.3); },
+    setDone: (n) => {
+      if (soundRef.current) { beep(660, 0.12); setTimeout(() => beep(660, 0.12), 150); setTimeout(() => beep(660, 0.2), 300); }
+      if (voiceRef.current) speak("Set " + n + " done");
+    },
+    tick: () => { if (soundRef.current) beep(1200, 0.05, 0.25); },
+    prep: () => { if (voiceRef.current) speak("Get ready"); },
+    finish: () => {
+      if (soundRef.current) { beep(523, 0.2); setTimeout(() => beep(659, 0.2), 180); setTimeout(() => beep(784, 0.35), 360); }
+      if (voiceRef.current) speak("Finished");
+    },
+  };
+
+  const keepAwake = () => {
+    try {
+      if ("wakeLock" in navigator) navigator.wakeLock.request("screen").then((w) => { wakeRef.current = w; }).catch(() => {});
+    } catch {}
+  };
+  const releaseAwake = () => { try { if (wakeRef.current) { wakeRef.current.release(); wakeRef.current = null; } } catch {} };
+
+  const buildSchedule = () => {
+    const s = [];
+    if (cfg.prep > 0) s.push({ type: "prep", dur: cfg.prep, rep: 0, set: 1 });
+    for (let set = 1; set <= cfg.sets; set++) {
+      for (let rep = 1; rep <= cfg.reps; rep++) {
+        s.push({ type: "work", dur: cfg.work, rep, set });
+        if (rep !== cfg.reps && cfg.restRep > 0) s.push({ type: "restRep", dur: cfg.restRep, rep, set });
+      }
+      if (set < cfg.sets) {
+        if (manual) s.push({ type: "await", dur: 0, rep: cfg.reps, set }); // superset mode: wait for a tap instead of counting down
+        else if (cfg.restSet > 0) s.push({ type: "restSet", dur: cfg.restSet, rep: cfg.reps, set });
+      }
+    }
+    return s;
+  };
+
+  const enterPhase = (i) => {
+    const E = eng.current;
+    const ph = E.sched[i];
+    E.idx = i; E.lastTick = null;
+    if (ph.type === "await") {
+      E.status = "waiting";
+      cue.setDone(ph.set);
+      setDisp({ status: "waiting", type: "await", remain: 0, dur: 0, rep: ph.rep, set: ph.set, elapsed: (Date.now() - E.startedAt) / 1000 });
+      return;
+    }
+    E.status = "running";
+    E.endAt = Date.now() + ph.dur * 1000;
+    if (ph.type === "work") cue.work();
+    else if (ph.type === "restRep") cue.restRep();
+    else if (ph.type === "restSet") cue.setDone(ph.set);
+    else if (ph.type === "prep") cue.prep();
+    setDisp({ status: "running", type: ph.type, remain: ph.dur, dur: ph.dur, rep: ph.rep, set: ph.set, elapsed: (Date.now() - E.startedAt) / 1000 });
+  };
+
+  const finish = () => {
+    const E = eng.current;
+    clearInterval(E.id); E.id = null; E.status = "done";
+    releaseAwake(); cue.finish();
+    setDisp({ status: "done", type: "done", remain: 0, dur: 0, rep: cfg.reps, set: cfg.sets, elapsed: (Date.now() - E.startedAt) / 1000 });
+  };
+
+  const tick = () => {
+    const E = eng.current;
+    if (E.status === "running") {
+      const ph = E.sched[E.idx];
+      const remain = (E.endAt - Date.now()) / 1000;
+      const whole = Math.ceil(remain);
+      if (whole <= 3 && whole > 0 && whole !== E.lastTick) { E.lastTick = whole; cue.tick(); }
+      if (remain <= 0) {
+        if (E.idx + 1 >= E.sched.length) { finish(); return; }
+        enterPhase(E.idx + 1);
+        return;
+      }
+      setDisp({ status: "running", type: ph.type, remain, dur: ph.dur, rep: ph.rep, set: ph.set, elapsed: (Date.now() - E.startedAt) / 1000 });
+    } else if (E.status === "waiting") {
+      setDisp((d) => ({ ...d, elapsed: (Date.now() - E.startedAt) / 1000 }));
+    }
+  };
+
+  const start = () => {
+    const E = eng.current;
+    const c = audioCtx(); try { if (c && c.state === "suspended") c.resume(); } catch {}
+    if (E.status === "paused") {
+      E.status = "running"; E.endAt = Date.now() + E.remainPaused * 1000;
+      keepAwake();
+      if (!E.id) E.id = setInterval(tick, 100);
+      return;
+    }
+    if (E.status === "waiting") { keepAwake(); enterPhase(E.idx + 1); return; }
+    if (E.status === "running") return;
+    const sched = buildSchedule();
+    if (!sched.length) return;
+    E.sched = sched; E.startedAt = Date.now();
+    keepAwake();
+    enterPhase(0);
+    if (!E.id) E.id = setInterval(tick, 100);
+  };
+
+  const pause = () => {
+    const E = eng.current;
+    if (E.status !== "running") return;
+    E.status = "paused";
+    E.remainPaused = Math.max(0, (E.endAt - Date.now()) / 1000);
+    releaseAwake();
+    setDisp((d) => ({ ...d, status: "paused" }));
+  };
+
+  const resetTimer = (nextCfg) => {
+    const E = eng.current;
+    clearInterval(E.id); E.id = null; E.status = "idle";
+    releaseAwake();
+    const c = nextCfg || cfg;
+    setDisp({ status: "idle", type: null, remain: c.prep > 0 ? c.prep : c.work, dur: 0, rep: 0, set: 0, elapsed: 0 });
+  };
+
+  useEffect(() => {
+    const h = () => {
+      const st = eng.current.status;
+      if (document.visibilityState === "visible" && (st === "running" || st === "waiting")) keepAwake();
+    };
+    document.addEventListener("visibilitychange", h);
+    return () => { document.removeEventListener("visibilitychange", h); clearInterval(eng.current.id); releaseAwake(); };
+  }, []);
+
+  const setField = (k, v, f) => {
+    const val = Math.max(f.min, Math.min(f.max, v | 0));
+    const next = { ...cfg, [k]: val };
+    setCfg(next);
+    if (eng.current.status === "idle" || eng.current.status === "done") resetTimer(next);
+  };
+  const applyPreset = (p) => { const next = { ...p }; setCfg(next); resetTimer(next); };
+  const activePreset = Object.keys(TIMER_PRESETS).find((k) =>
+    TIMER_FIELDS.every((f) => TIMER_PRESETS[k][f.k] === cfg[f.k])
+  );
+
+  const running = disp.status === "running" || disp.status === "paused";
+  const isBreak = disp.type === "restSet" || disp.type === "await";
+  const col = disp.status === "idle" ? "#8b8f98" : TCOLOR[disp.type] || "#8b8f98";
+  const primaryLabel = { idle: "Start", running: "Pause", paused: "Resume", waiting: "Next set", done: "Start" }[disp.status];
+  const sub = disp.status === "idle" ? "Pick a preset, then Start"
+    : disp.status === "paused" ? "Paused"
+    : disp.type === "work" ? (cfg.work <= 6 ? "Max effort" : "Hold")
+    : disp.type === "restRep" ? "Next rep coming"
+    : disp.type === "restSet" ? "Shake out — next set soon"
+    : disp.type === "await" ? "Do your superset pair, then tap Next set"
+    : disp.type === "prep" ? "Get set"
+    : disp.type === "done" ? "Complete" : "";
+  const frac = disp.dur > 0 ? 1 - disp.remain / disp.dur : disp.status === "waiting" || disp.status === "done" ? 1 : 0;
+  const toggleBtn = (on) => ({ ...ui.chip, flex: 1, minWidth: 110, padding: "11px 8px", ...(on ? { borderColor: "#E0A93E", color: "#E0A93E" } : {}) });
+
+  return (
+    <>
+      <div style={{
+        background: isBreak && disp.status !== "idle" ? "#182430" : "#1d2026",
+        border: `1px solid ${disp.status === "idle" ? "#33363e" : col}`,
+        borderRadius: 16, padding: "22px 16px", textAlign: "center",
+      }}>
+        <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: col }}>
+          {disp.status === "idle" ? "Ready" : TLABEL[disp.type]}
+        </div>
+        <div style={{ fontSize: 76, fontWeight: 900, lineHeight: 1.05, fontVariantNumeric: "tabular-nums", color: disp.status === "idle" ? "#f2efe8" : col }}>
+          {disp.status === "done" ? "✓" : disp.status === "waiting" ? "•" : Math.max(0, Math.ceil(disp.remain))}
+        </div>
+        <div style={{ fontSize: 13, color: "#8b8f98", minHeight: 18 }}>{sub}</div>
+        <div style={{ height: 8, borderRadius: 6, background: "#14161a", overflow: "hidden", marginTop: 14 }}>
+          <div style={{ height: "100%", width: `${frac * 100}%`, background: col, transition: "width 0.1s linear" }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", gap: 26, marginTop: 14 }}>
+          <Stat label="Rep" value={disp.rep ? `${disp.rep}/${cfg.reps}` : "–"} />
+          <Stat label="Set" value={disp.set ? `${disp.set}/${cfg.sets}` : "–"} />
+          <Stat label="Elapsed" value={mmss(disp.elapsed)} />
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button style={{ ...ui.primary, flex: 2, background: disp.status === "waiting" ? TCOLOR.work : "#E0A93E" }}
+            onClick={() => (disp.status === "running" ? pause() : start())}>
+            {primaryLabel}
+          </button>
+          <button style={{ ...ui.ghost, flex: 1, marginTop: 0 }} onClick={() => resetTimer()}>Reset</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 14 }}>
+        {Object.keys(TIMER_PRESETS).map((k) => {
+          const p = TIMER_PRESETS[k];
+          const on = activePreset === k;
+          return (
+            <button key={k} onClick={() => applyPreset(p)}
+              style={{
+                background: on ? "#2a2418" : "#1d2026", border: `1px solid ${on ? "#E0A93E" : "#33363e"}`,
+                borderRadius: 12, padding: "11px 10px", textAlign: "left", cursor: "pointer",
+                color: "#f2efe8", fontSize: 13, fontWeight: 600, lineHeight: 1.35,
+              }}>
+              {p.name}
+              <span style={{ display: "block", color: "#8b8f98", fontWeight: 400, fontSize: 11, marginTop: 2 }}>{p.desc}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <button style={{ ...ui.linkBtn, display: "block", margin: "12px auto 0" }} onClick={() => setCfgOpen(!cfgOpen)}>
+        {cfgOpen ? "hide custom settings" : "custom settings"}
+      </button>
+      {cfgOpen && (
+        <div style={{ ...ui.card, marginTop: 6 }}>
+          {TIMER_FIELDS.map((f, i) => (
+            <div key={f.k} style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              padding: "9px 0", borderTop: i ? "1px solid #24262c" : "none",
+            }}>
+              <label style={{ fontSize: 14 }}>
+                {f.label}
+                <small style={{ display: "block", color: "#8b8f98", fontSize: 11 }}>{f.note}</small>
+              </label>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button style={{ ...ui.chip, width: 38, height: 38, padding: 0, fontSize: 20, borderRadius: 10 }}
+                  onClick={() => setField(f.k, cfg[f.k] - f.step, f)}>–</button>
+                <input style={{ ...ui.input, width: 58, textAlign: "center" }} inputMode="numeric" value={cfg[f.k]}
+                  onChange={(e) => { const n = parseInt(e.target.value, 10); setField(f.k, isNaN(n) ? f.min : n, f); }} />
+                <button style={{ ...ui.chip, width: 38, height: 38, padding: 0, fontSize: 20, borderRadius: 10 }}
+                  onClick={() => setField(f.k, cfg[f.k] + f.step, f)}>+</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+        <button style={toggleBtn(sound)} onClick={() => { setSound(!sound); if (!sound) { audioCtx(); beep(880, 0.12); } }}>
+          {sound ? "🔊 Beeps on" : "🔇 Beeps off"}
+        </button>
+        <button style={toggleBtn(voice)} onClick={() => { setVoice(!voice); if (!voice) speak("Voice on"); }}>
+          {voice ? "🗣 Voice on" : "Voice off"}
+        </button>
+        <button style={toggleBtn(manual)} onClick={() => { setManual(!manual); if (eng.current.status === "idle") resetTimer(); }}>
+          {manual ? "✋ Manual set advance" : "Auto set rest"}
+        </button>
+      </div>
+      <p style={{ color: "#8b8f98", fontSize: 12, lineHeight: 1.5, margin: "14px 4px 0" }}>
+        Manual set advance replaces the set-rest countdown with a "tap when ready" hold — for supersets, where your rest is the other exercise.
+        Screen stays awake while running. Phone must be off silent for beeps.
+      </p>
+    </>
+  );
+}
+
 // ---------- styles ----------
 const ui = {
   shell: {
     minHeight: "100vh", background: "#14161a", color: "#f2efe8",
     fontFamily: "-apple-system, 'Segoe UI', Roboto, sans-serif", maxWidth: 460, margin: "0 auto",
   },
-  header: {
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-    padding: "16px 16px 10px", borderBottom: "1px solid #24262c",
-  },
+  header: { padding: "16px 16px 12px", borderBottom: "1px solid #24262c" },
   brand: { fontWeight: 900, letterSpacing: 3, fontSize: 15 },
   sub: { fontSize: 11, color: "#8b8f98", marginTop: 2 },
   tab: {
