@@ -47,6 +47,9 @@ const ENTRY_PLACEHOLDER = {
   note: "Anything worth remembering — travel, sleep, motivation, gym conditions.",
 };
 const DAY_AFTER = ["better", "same", "worse"];
+const DAY_TYPES = ["A", "B", "C"]; // A = limit/projecting (off the effort trend), B = flash-grade average, C = above it
+// Sessions that belong on the effort trend: not an A day, and not an empty accidental session.
+const onTrend = (s) => s.day_type !== "A" && (s.legacy || (s.climbs || []).length > 0);
 const DAY_AFTER_COLOR = { better: "#6BBF8A", same: "#c9ccd6", worse: "#E0A93E" };
 const KEY = "boulderlog-v1";
 const pts = (g) => Math.max(1, g); // V0 & V1 = 1
@@ -137,12 +140,12 @@ function download(name, text, type = "text/markdown") {
 }
 
 // ---------- sharing suite (6a/6b/6c) ----------
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2; // v2 adds session.day_type; v1 backups import unchanged
 
 function sessionShareText(s) {
   const st = sessionStats(s);
   const L = [];
-  L.push(`# Boulder Log — ${s.date} ${s.label || ""}${s.intent ? ` [${s.intent}]` : ""}`.trimEnd());
+  L.push(`# Boulder Log — ${s.date} ${s.label || ""}${s.day_type ? ` [${s.day_type} day]` : ""}`.trimEnd());
   L.push(`Problems: ${st.climbs} | Effort: ${st.effort}${s.legacy ? "" : ` | Sends: ${st.sends} (${st.sendScore})`}`);
   const led = ledger(st.dist);
   if (led) L.push(`Ledger: ${led}`);
@@ -182,7 +185,7 @@ function digestText(data, maxChars = 4000) {
       sess.forEach((s) => {
         const st = sessionStats(s);
         const led = ledger(st.dist);
-        L.push(`- ${s.date}${s.intent ? ` [${s.intent}]` : ""} ${st.climbs}p, effort ${st.effort}${led ? `, ${led}` : ""}`);
+        L.push(`- ${s.date}${s.day_type ? ` [${s.day_type} day]` : ""} ${st.climbs}p, effort ${st.effort}${led ? `, ${led}` : ""}`);
         const extra = [];
         if (s.day_after) extra.push(`day-after: ${s.day_after.status}${s.day_after.note ? ` ${s.day_after.note}` : ""}`);
         if (s.notes) extra.push(`notes: ${s.notes.replace(/\n/g, " ")}`);
@@ -373,7 +376,7 @@ function BoulderLog() {
   const update = (fn) => setData((d) => ({ ...d, sessions: d.sessions.map(fn) }));
 
   const startSession = () => {
-    const s = { id: "S" + Date.now(), date: todayStr(), label: "Lehi", goal: "", exercises: "", notes: "", climbs: [], ended: false };
+    const s = { id: "S" + Date.now(), date: todayStr(), label: "Lehi", day_type: null, goal: "", exercises: "", notes: "", climbs: [], ended: false };
     setData((d) => ({ ...d, sessions: [...d.sessions, s] }));
     setTab("session");
   };
@@ -473,6 +476,7 @@ function BoulderLog() {
       sessions: d.sessions.filter((s) => s.id !== id),
       deleted: [...(d.deleted || []), id],
     }));
+  const editSession = (id, patch) => update((s) => (s.id === id ? { ...s, ...patch } : s));
 
   // ----- standalone entries (feature 1) -----
   const blankEntry = () => ({ date: todayStr(), kind: "", test_name: "", test_value: "", test_unit: "", note: "" });
@@ -680,6 +684,17 @@ function BoulderLog() {
                 );
               })()}
 
+              {/* day type + gym */}
+              <div style={ui.sectionLabel}>DAY TYPE · GYM</div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                {DAY_TYPES.map((t) => (
+                  <button key={t} onClick={() => patchSession({ day_type: active.day_type === t ? null : t })}
+                    style={{ ...ui.chip, padding: "7px 14px", fontWeight: 700, ...(active.day_type === t ? ui.chipOn : {}) }}>{t}</button>
+                ))}
+                <input style={{ ...ui.input, flex: 1, minWidth: 0, marginLeft: 6 }} placeholder="gym"
+                  value={active.label || ""} onChange={(e) => patchSession({ label: e.target.value })} />
+              </div>
+
               {/* grade holds */}
               <div style={ui.sectionLabel}>{mode === "fell" ? "GRADE-LEVEL EFFORT OF THE ATTEMPT" : "GRADE"}</div>
               <div style={ui.holdRow}>
@@ -833,7 +848,7 @@ function BoulderLog() {
       </div>
 
       {tab === "history" && (
-        <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} onShare={doShare} />
+        <History sessions={data.sessions} entries={data.entries || []} onDelete={deleteSession} onDeleteEntry={deleteEntry} onShare={doShare} onEdit={editSession} />
       )}
 
       {tab === "export" && (
@@ -891,14 +906,92 @@ function Stat({ label, value, accent }) {
   );
 }
 
-function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
+function MonthlySends({ sessions }) {
+  // sends only, real (non-notebook) sessions only — the notebook mixes sends and attempts
+  const counts = {}, monthSet = new Set(), gradeSet = new Set();
+  sessions.filter((s) => !s.legacy).forEach((s) => {
+    const m = s.date.slice(0, 7);
+    monthSet.add(m);
+    (s.climbs || []).forEach((c) => {
+      if (!c.sent) return;
+      const g = c.mb || c.gym;
+      gradeSet.add(g);
+      counts[m] = counts[m] || {};
+      counts[m][g] = (counts[m][g] || 0) + 1;
+    });
+  });
+  const months = [...monthSet].sort();
+  const grades = [...gradeSet].sort((a, b) => {
+    const d = keyPts(a) - keyPts(b);
+    return d !== 0 ? d : MB_PTS[a] !== undefined ? 1 : -1;
+  });
+  if (!months.length || !grades.length) return null;
+  const max = Math.max(1, ...months.flatMap((m) => grades.map((g) => (counts[m] || {})[g] || 0)));
+  const multiYear = new Set(months.map((m) => m.slice(0, 4))).size > 1;
+  const monthLabel = (m) => new Date(m + "-15T12:00:00").toLocaleDateString(undefined, multiYear ? { month: "short", year: "2-digit" } : { month: "short" });
+  const cell = { padding: "4px 6px", textAlign: "left", whiteSpace: "nowrap" };
+  return (
+    <>
+      <div style={ui.sectionLabel}>SENDS BY MONTH</div>
+      <div style={{ ...ui.card, marginTop: 0, padding: "8px 10px", overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", fontFamily: "ui-monospace, monospace", fontSize: 12, color: "#c9ccd6", minWidth: "100%" }}>
+          <thead>
+            <tr style={{ color: "#8b8f98" }}>
+              <th style={cell}></th>
+              {months.map((m) => <th key={m} style={cell}>{monthLabel(m)}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {grades.map((g) => (
+              <tr key={g}>
+                <td style={{ ...cell, fontWeight: 700, color: "#f2efe8" }}>{MB_PTS[g] !== undefined ? g : `V${g}`}</td>
+                {months.map((m) => {
+                  const n = (counts[m] || {})[g] || 0;
+                  return (
+                    <td key={m} style={{ ...cell, minWidth: 64 }}>
+                      {n > 0 && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ height: 10, width: Math.max(4, Math.round((n / max) * 44)), borderRadius: 3, background: "#E0A93E", opacity: 0.35 + 0.65 * (n / max) }} />
+                          <span>{n}</span>
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function History({ sessions, entries, onDelete, onDeleteEntry, onShare, onEdit }) {
   const [confirmId, setConfirmId] = useState(null);
+  const [editId, setEditId] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const startEdit = (s) => {
+    setEditId(s.id);
+    setDraft({
+      label: s.label || "", day_type: s.day_type || null, goal: s.goal || "", exercises: s.exercises || "", notes: s.notes || "",
+      da_status: s.day_after ? s.day_after.status : null, da_note: s.day_after ? s.day_after.note || "" : "",
+    });
+  };
+  const saveEdit = (s) => {
+    const patch = { label: draft.label.trim(), day_type: draft.day_type, goal: draft.goal, exercises: draft.exercises, notes: draft.notes };
+    patch.day_after = draft.da_status
+      ? { status: draft.da_status, note: draft.da_note.trim(), recorded_at: (s.day_after && s.day_after.recorded_at) || new Date().toISOString() }
+      : undefined;
+    onEdit(s.id, patch);
+    setEditId(null); setDraft(null);
+  };
   // sessions and standalone entries interleaved by date, sessions first on ties
   const items = [
     ...sessions.map((s) => ({ kind: "session", date: s.date, obj: s })),
     ...entries.map((e) => ({ kind: "entry", date: e.date, obj: e })),
   ].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : a.kind === "session" ? -1 : 1));
-  const chron = [...sessions].sort((a, b) => (a.date > b.date ? 1 : -1));
+  const chron = [...sessions].filter(onTrend).sort((a, b) => (a.date > b.date ? 1 : -1)); // B/C days only
   const scores = chron.map((s) => sessionStats(s).effort);
   const max = Math.max(...scores, 1), min = Math.min(...scores, 0);
   const W = 320, H = 90, PAD = 8;
@@ -915,7 +1008,8 @@ function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
           <circle key={i} cx={x(i)} cy={y(v)} r="3.5" fill={chron[i].legacy ? "#8b8f98" : "#E0A93E"} />
         ))}
       </svg>
-      <div style={{ fontSize: 11, color: "#8b8f98", margin: "6px 0 14px" }}>grey dots = notebook sessions</div>
+      <div style={{ fontSize: 11, color: "#8b8f98", margin: "6px 0 14px" }}>grey dots = notebook sessions · A days and empty sessions are not plotted</div>
+      <MonthlySends sessions={sessions} />
 
       {items.map((it) => {
         if (it.kind === "entry") {
@@ -955,11 +1049,49 @@ function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
         }
         const s = it.obj;
         const st = sessionStats(s);
+        if (editId === s.id && draft) {
+          return (
+            <div key={s.id} style={{ ...ui.card, border: "1px solid #E0A93E" }}>
+              <b>Edit {fmtDate(s.date)}</b>
+              <div style={{ ...ui.chipRow, marginTop: 10 }}>
+                {DAY_TYPES.map((t) => (
+                  <button key={t} onClick={() => setDraft({ ...draft, day_type: draft.day_type === t ? null : t })}
+                    style={{ ...ui.chip, padding: "7px 14px", fontWeight: 700, ...(draft.day_type === t ? ui.chipOn : {}) }}>{t}</button>
+                ))}
+                <input style={{ ...ui.input, flex: 1, minWidth: 0 }} placeholder="gym"
+                  value={draft.label} onChange={(e) => setDraft({ ...draft, label: e.target.value })} />
+              </div>
+              <input style={{ ...ui.input, width: "100%", boxSizing: "border-box", marginTop: 10 }} placeholder="goal"
+                value={draft.goal} onChange={(e) => setDraft({ ...draft, goal: e.target.value })} />
+              <textarea style={{ ...ui.textarea, marginTop: 10 }} rows={5} placeholder="warm-up & exercises"
+                value={draft.exercises} onChange={(e) => setDraft({ ...draft, exercises: e.target.value })} />
+              <textarea style={{ ...ui.textarea, marginTop: 10 }} rows={4} placeholder="session notes"
+                value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
+              <div style={ui.chipRow}>
+                <span style={ui.chipLabel}>Day after</span>
+                {DAY_AFTER.map((w) => (
+                  <button key={w} onClick={() => setDraft({ ...draft, da_status: draft.da_status === w ? null : w })}
+                    style={{ ...ui.chip, ...(draft.da_status === w ? ui.chipOn : {}) }}>{w}</button>
+                ))}
+              </div>
+              {draft.da_status && (
+                <input style={{ ...ui.input, width: "100%", boxSizing: "border-box", marginTop: 8 }} placeholder="day-after note"
+                  value={draft.da_note} onChange={(e) => setDraft({ ...draft, da_note: e.target.value })} />
+              )}
+              <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                <button style={{ ...ui.primary, flex: 1 }} onClick={() => saveEdit(s)}>Save</button>
+                <button style={{ ...ui.ghost, flex: 1 }} onClick={() => { setEditId(null); setDraft(null); }}>Cancel</button>
+              </div>
+            </div>
+          );
+        }
         return (
           <div key={s.id} style={ui.card}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <b>{fmtDate(s.date)} · {s.label}{s.legacy ? " (notebook)" : ""}</b>
-              <b style={{ color: "#E0A93E" }}>{st.effort}</b>
+              <b>{fmtDate(s.date)} · {s.label}{s.legacy ? " (notebook)" : ""}{s.day_type && s.day_type !== "A" ? ` · ${s.day_type} day` : ""}</b>
+              {s.day_type === "A"
+                ? <b style={{ color: "#8b8f98" }}>A day</b>
+                : <b style={{ color: "#E0A93E" }}>{st.effort}</b>}
             </div>
             <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 13, color: "#c9ccd6", marginTop: 4 }}>
               {ledger(st.dist)}
@@ -996,6 +1128,7 @@ function History({ sessions, entries, onDelete, onDeleteEntry, onShare }) {
             ) : (
               <div style={{ display: "flex", gap: 14 }}>
                 <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => onShare(sessionShareText(s))}>share</button>
+                <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => startEdit(s)}>edit</button>
                 <button style={{ ...ui.linkBtn, padding: "6px 0 0" }} onClick={() => setConfirmId(s.id)}>delete</button>
               </div>
             )}
