@@ -54,26 +54,10 @@ const DAY_AFTER_COLOR = { better: "#6BBF8A", same: "#c9ccd6", worse: "#E0A93E" }
 const KEY = "boulderlog-v1";
 const pts = (g) => Math.max(1, g); // V0 & V1 = 1
 
-const LEGACY = [
-  { id: "L1", date: "2026-06-20", label: "Bouldering", dist: { 1: 1, 2: 4, 3: 11 }, score: 43, probs: 16 },
-  { id: "L2", date: "2026-07-11", label: "Lehi", dist: { 1: 1, 2: 2, 3: 7, 4: 6 }, score: 50, probs: 16 },
-  { id: "L3", date: "2026-07-14", label: "Lehi", dist: { 2: 8, 3: 8 }, score: 40, probs: 16 },
-  { id: "L4", date: "2026-07-16", label: "Lehi", dist: { 2: 2, 3: 7, 4: 7 }, score: 53, probs: 16 },
-  { id: "L5", date: "2026-07-18", label: "Lehi", dist: { 3: 6, 4: 10 }, score: 58, probs: 15 },
-  { id: "L6", date: "2026-07-21", label: "Lehi", dist: { 3: 1, 4: 8 }, score: 35, probs: 9,
-    notes: "Tweaky left middle finger, 2nd knuckle. Decided to do some open hand hangs and call it a day." },
-  { id: "L7", date: "2026-07-30", label: "Lehi", dist: { 3: 2, 4: 13 }, score: 58, probs: 15 },
-  // Reconstructed from memory after storage failure — scores approximate, no grade distribution.
-  { id: "L8", date: "2026-07-23", label: "Lehi", dist: {}, score: 52, probs: null,
-    notes: "Approximate — session lost to storage failure. Recalled as low fifties." },
-  { id: "L9", date: "2026-07-25", label: "Lehi", dist: {}, score: 40, probs: null,
-    notes: "Approximate — session lost to storage failure. Recalled as relatively low." },
-  { id: "L10", date: "2026-07-28", label: "Lehi", dist: {}, score: 40, probs: null,
-    notes: "Approximate — session lost to storage failure. Recalled as relatively low." },
-  { id: "L11", date: "2026-08-10", label: "Lehi", dist: { 3: 2, 4: 10, 5: 1 }, score: 51, probs: 13,
-    notes: "All 13 sent. One V4 onsight, the rest repeats. Session lost to phone storage, reconstructed same day.",
-    exercises: "Superset 1:\n5 sets, 10 sec dead hang, pronated\n3 sets, 10 rep wrist extension, 20 lbs\n\nSuperset 2:\n3 sets, 10 sec 90-degree lock off, pronated\n3 sets, 20 reps single leg floor bridges (alternating legs)\n3 sets, 10 reps two arm curls, +0 lbs\n\nSuperset 3:\n5 sets of three pull ups\n3 sets of finger warmups, 5 reps of 5:5 repeaters" },
-].map((s) => ({ ...s, legacy: true }));
+// Notebook-era sessions used to be hard-coded here. They now live only in the owner's own
+// device storage and backup files — the public app ships with no personal data. The merge
+// on load is kept as a no-op so `legacy`-flagged records and their tombstones stay valid.
+const LEGACY = [];
 
 // ---------- helpers ----------
 // Local dates, not UTC — evening sessions must not roll over to tomorrow's date.
@@ -376,7 +360,8 @@ function BoulderLog() {
   const update = (fn) => setData((d) => ({ ...d, sessions: d.sessions.map(fn) }));
 
   const startSession = () => {
-    const s = { id: "S" + Date.now(), date: todayStr(), label: "Lehi", day_type: null, goal: "", exercises: "", notes: "", climbs: [], ended: false };
+    const lastLabel = [...data.sessions].filter((s) => !s.legacy && s.label).sort((a, b) => (a.date < b.date ? 1 : -1))[0]?.label || ""; // default gym = last one used
+    const s = { id: "S" + Date.now(), date: todayStr(), label: lastLabel, day_type: null, goal: "", exercises: "", notes: "", climbs: [], ended: false };
     setData((d) => ({ ...d, sessions: [...d.sessions, s] }));
     setTab("session");
   };
